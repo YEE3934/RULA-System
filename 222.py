@@ -257,12 +257,10 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
                         if is_success:
                             zip_images.append((f"Sample_{i+1:03d}_{sec}s_BestCam.jpg", buffer.tobytes()))
                     
-                    # 更新網頁進度條
                     progress_bar.progress((i + 1) / total_samples)
                     status_text.text(f"影像辨識進度: {i+1} / {total_samples} 筆完成")
 
             # ==================== 【主程式：打包 ZIP 提供下載】 ====================
-            # 建立記憶體緩衝區來存放 ZIP，避免在雲端無權限寫入硬碟的問題
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w') as zf:
                 if records:
@@ -273,12 +271,8 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
                 for filename, img_bytes in zip_images:
                     zf.writestr(f"照片庫/{filename}", img_bytes)
             
-            st.success(" 分析完成！請點擊下方按鈕下載完整數據與照片。")
+            st.success("✅ 分析完成！請點擊下方按鈕下載完整數據與照片。")
             
-            # 顯示下載按鈕
-           st.success("✅ 分析完成！請點擊下方按鈕下載完整數據與照片。")
-            
-            # 顯示下載按鈕
             st.download_button(
                 label="📦 下載 RULA 稽核報表 (ZIP)",
                 data=zip_buffer.getvalue(),
