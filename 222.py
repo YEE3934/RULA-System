@@ -47,30 +47,7 @@ TABLE_C = [
     [4, 4, 4, 5, 6, 7, 7], [4, 4, 5, 6, 6, 7, 7], [5, 5, 6, 6, 7, 7, 7], [5, 5, 6, 7, 7, 7, 7]
 ]
 
-# ==================== 【核心判定與幾何計算】 ====================
-def get_upper_arm_score(angle): 
-    return 1 if angle <= 20 else (2 if angle <= 45 else (3 if angle <= 90 else 4))
-
-def get_lower_arm_score(angle): 
-    return 1 if 60 <= angle <= 100 else 2
-
-def get_neck_score(angle): 
-    return 1 if angle <= 10 else (2 if angle <= 20 else 3)
-
-def get_trunk_score(angle): 
-    return 1 if angle <= 5 else (2 if angle <= 20 else (3 if angle <= 60 else 4))
-
-def compute_rula_full_score(upper_arm, lower_arm, neck, trunk, muscle_val, force_val):
-    ua, la, w, wt = min(max(upper_arm, 1), 6), min(max(lower_arm, 1), 3), 1, 1
-    nk, tk, lg = min(max(neck, 1), 6), min(max(trunk, 1), 6), 1
-    score_a = TABLE_A[ua][la][w][wt]
-    score_b = TABLE_B[nk][tk][lg]
-    score_c = score_a + muscle_val + force_val
-    score_d = score_b + muscle_val + force_val
-    grand_score = TABLE_C[min(score_c, 8) - 1][min(score_d, 7) - 1]
-    al_num = 1 if grand_score <= 2 else (2 if grand_score <= 4 else (3 if grand_score <= 6 else 4))
-    return score_a, score_b, score_c, score_d, grand_score, f"AL{al_num}"
-
+# ==================== 【人因工程規範幾何計算】 ====================
 def calculate_3d_angle(a, b, c):
     ba = np.array(a) - np.array(b)
     bc = np.array(c) - np.array(b)
@@ -80,6 +57,53 @@ def calculate_3d_angle(a, b, c):
         return 0.0
     cosine = np.clip(np.dot(ba, bc) / (norm_ba * norm_bc), -1.0, 1.0)
     return float(np.degrees(np.arccos(cosine)))
+
+def get_upper_arm_score(angle, is_abducted=False, is_raised=False):
+    # RULA Step 1 屈曲基準分
+    if angle <= 20: base = 1
+    elif angle <= 45: base = 2
+    elif angle <= 90: base = 3
+    else: base = 4
+    
+    # 正面視角加分特徵：外展 +1、聳肩 +1
+    if is_abducted: base += 1
+    if is_raised: base += 1
+    return min(max(base, 1), 6)
+
+def get_lower_arm_score(angle, is_across_midline=False):
+    # RULA Step 2
+    base = 1 if 60 <= angle <= 100 else 2
+    if is_across_midline: base += 1
+    return min(max(base, 1), 3)
+
+def get_neck_score(angle, is_twisted=False, is_side_bending=False):
+    # RULA Step 9
+    if angle <= 10: base = 1
+    elif angle <= 20: base = 2
+    else: base = 3
+    if is_twisted: base += 1
+    if is_side_bending: base += 1
+    return min(max(base, 1), 6)
+
+def get_trunk_score(angle, is_twisted=False, is_side_bending=False):
+    # RULA Step 10
+    if angle <= 5: base = 1
+    elif angle <= 20: base = 2
+    elif angle <= 60: base = 3
+    else: base = 4
+    if is_twisted: base += 1
+    if is_side_bending: base += 1
+    return min(max(base, 1), 6)
+
+def compute_rula_side_score(ua, la, nk, tk, m_val, f_val):
+    w, wt, lg = 1, 1, 1
+    score_a = TABLE_A[ua][la][w][wt]
+    score_b = TABLE_B[nk][tk][lg]
+    score_c = score_a + m_val + f_val
+    score_d = score_b + m_val + f_val
+    grand_score = TABLE_C[min(score_c, 8) - 1][min(score_d, 7) - 1]
+    al_num = 1 if grand_score <= 2 else (2 if grand_score <= 4 else (3 if grand_score <= 6 else 4))
+    return score_a, score_b, score_c, score_d, grand_score, f"AL{al_num}"
 
 def put_chinese_text(img, text, position, color, size=15):
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
@@ -108,171 +132,215 @@ def put_chinese_text(img, text, position, color, size=15):
     draw.text(position, text, fill=(color[2], color[1], color[0]), font=font)
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-# ==================== 【單張影像完整 AI 分析模組】 ====================
-def analyze_image(frame, pose_model, m_val, f_val):
+# ==================== 【正面鏡頭：冠狀面/水平面補正分析】 ====================
+def analyze_front_camera(frame, pose_model, target_side):
+    """
+    從正面鏡頭提取水平面與冠狀面特徵：
+    1. 上臂外展 (Abduction)
+    2. 手臂交叉過中線 (Across Midline)
+    3. 軀幹/頸部側彎 (Side Bending)
+    """
     orig_h, orig_w = frame.shape[:2]
     scale = min(800 / orig_w, 600 / orig_h)
     frame = cv2.resize(frame, (int(orig_w * scale), int(orig_h * scale)))
     
-    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose_model.process(image)
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose_model.process(img_rgb)
+    
+    if not results.pose_landmarks:
+        return False, {}, frame
+        
+    lm = results.pose_landmarks.landmark
+    
+    # 決定關鍵點索引
+    sh_idx = 12 if target_side == "右手側" else 11
+    el_idx = 14 if target_side == "右手側" else 13
+    wr_idx = 16 if target_side == "右手側" else 15
+    hip_idx = 24 if target_side == "右手側" else 23
+    
+    # 身體中線 X 座標
+    midline_x = (lm[11].x + lm[12].x + lm[23].x + lm[24].x) / 4.0
+    
+    # 1. 手臂外展判定 (手肘相對於肩髖連線的水平距離)
+    shoulder_width = abs(lm[11].x - lm[12].x)
+    elbow_out_dist = (lm[el_idx].x - lm[sh_idx].x) if target_side == "右手側" else (lm[sh_idx].x - lm[el_idx].x)
+    is_abducted = elbow_out_dist > shoulder_width * 0.35
+    
+    # 2. 手臂橫越中線判定
+    is_across_midline = (lm[wr_idx].x < midline_x) if target_side == "右手側" else (lm[wr_idx].x > midline_x)
+    
+    # 3. 軀幹側彎判定 (雙肩斜率與雙髖斜率)
+    shoulder_tilt = abs(lm[11].y - lm[12].y)
+    is_trunk_side_bending = shoulder_tilt > 0.08
+    
+    mods = {
+        "is_abducted": is_abducted,
+        "is_across_midline": is_across_midline,
+        "is_side_bending": is_trunk_side_bending
+    }
+    
+    mp.solutions.drawing_utils.draw_landmarks(frame, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
+    return True, mods, frame
+
+# ==================== 【側視角鏡頭：矢狀面主要人因量測】 ====================
+def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val):
+    orig_h, orig_w = frame.shape[:2]
+    scale = min(800 / orig_w, 600 / orig_h)
+    frame = cv2.resize(frame, (int(orig_w * scale), int(orig_h * scale)))
+    
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose_model.process(img_rgb)
+    frame_annotated = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     
     if not results.pose_world_landmarks or not results.pose_landmarks:
-        return False, None, image, 0.0
+        return False, None, frame_annotated, 0.0
         
-    mp.solutions.drawing_utils.draw_landmarks(image, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
+    mp.solutions.drawing_utils.draw_landmarks(frame_annotated, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
     w_lm = results.pose_world_landmarks.landmark
     n_lm = results.pose_landmarks.landmark
     
     try:
-        conf_neck = (n_lm[7].visibility + n_lm[8].visibility + n_lm[11].visibility + n_lm[12].visibility) / 4 * 100
-        conf_r_arm = (n_lm[24].visibility + n_lm[12].visibility + n_lm[14].visibility + n_lm[16].visibility) / 4 * 100
-        conf_l_arm = (n_lm[23].visibility + n_lm[11].visibility + n_lm[13].visibility + n_lm[15].visibility) / 4 * 100
-        overall_conf = (conf_neck + conf_r_arm + conf_l_arm) / 3 
-
-        core_visibilities = [n_lm[11].visibility, n_lm[12].visibility, n_lm[23].visibility, n_lm[24].visibility]
-        if min(core_visibilities) < 0.35:
-            overall_conf *= 0.3
-
-        shoulder_width_2d = abs(n_lm[11].x - n_lm[12].x)
-        trunk_length_2d = math.hypot(((n_lm[11].x + n_lm[12].x) / 2) - ((n_lm[23].x + n_lm[24].x) / 2),
-                                     ((n_lm[11].y + n_lm[12].y) / 2) - ((n_lm[23].y + n_lm[24].y) / 2))
-        if trunk_length_2d > 0 and shoulder_width_2d > trunk_length_2d * 0.85: 
-            overall_conf *= 0.5 
-
-        ls, rs = [w_lm[11].x, w_lm[11].y, w_lm[11].z], [w_lm[12].x, w_lm[12].y, w_lm[12].z]
-        le, re = [w_lm[13].x, w_lm[13].y, w_lm[13].z], [w_lm[14].x, w_lm[14].y, w_lm[14].z]
-        lw, rw = [w_lm[15].x, w_lm[15].y, w_lm[15].z], [w_lm[16].x, w_lm[16].y, w_lm[16].z]
-        lh, rh = [w_lm[23].x, w_lm[23].y, w_lm[23].z], [w_lm[24].x, w_lm[24].y, w_lm[24].z]
-        le_ear, ri_ear = [w_lm[7].x, w_lm[7].y, w_lm[7].z], [w_lm[8].x, w_lm[8].y, w_lm[8].z]
-
-        # 1. 前臂角度 (Lower Arm)
-        ang_r_lower_arm = abs(180.0 - calculate_3d_angle(rs, re, rw))
-        ang_l_lower_arm = abs(180.0 - calculate_3d_angle(ls, le, lw))
-
-        # 2. 上臂角度 (Upper Arm)
-        mid_sh = [(ls[0] + rs[0]) / 2, (ls[1] + rs[1]) / 2, (ls[2] + rs[2]) / 2]
-        mid_hip = [(lh[0] + rh[0]) / 2, (lh[1] + rh[1]) / 2, (lh[2] + rh[2]) / 2]
+        sh_idx = 12 if target_side == "右手側" else 11
+        el_idx = 14 if target_side == "右手側" else 13
+        wr_idx = 16 if target_side == "右手側" else 15
+        hip_idx = 24 if target_side == "右手側" else 23
+        ear_idx = 8 if target_side == "右手側" else 7
         
-        trunk_dir_r = [rh[0] - rs[0], rh[1] - rs[1], rh[2] - rs[2]]
-        trunk_dir_l = [lh[0] - ls[0], lh[1] - ls[1], lh[2] - ls[2]]
+        # 遮擋防護：評估側關節能見度過低時標記信賴度低
+        visibilities = [n_lm[sh_idx].visibility, n_lm[el_idx].visibility, n_lm[wr_idx].visibility, n_lm[hip_idx].visibility]
+        conf_side = float(np.mean(visibilities) * 100)
         
-        ref_r_point = [rs[0] + trunk_dir_r[0], rs[1] + trunk_dir_r[1], rs[2] + trunk_dir_r[2]]
-        ref_l_point = [ls[0] + trunk_dir_l[0], ls[1] + trunk_dir_l[1], ls[2] + trunk_dir_l[2]]
+        sh = [w_lm[sh_idx].x, w_lm[sh_idx].y, w_lm[sh_idx].z]
+        el = [w_lm[el_idx].x, w_lm[el_idx].y, w_lm[el_idx].z]
+        wr = [w_lm[wr_idx].x, w_lm[wr_idx].y, w_lm[wr_idx].z]
+        hp = [w_lm[hip_idx].x, w_lm[hip_idx].y, w_lm[hip_idx].z]
+        ear = [w_lm[ear_idx].x, w_lm[ear_idx].y, w_lm[ear_idx].z]
         
-        ang_r_upper_arm = calculate_3d_angle(ref_r_point, rs, re)
-        ang_l_upper_arm = calculate_3d_angle(ref_l_point, ls, le)
-
-        # 3. 軀幹角度 (Trunk)
-        hip_vertical_up = [mid_hip[0], mid_hip[1] - 1.0, mid_hip[2]] 
-        ang_trunk = calculate_3d_angle(hip_vertical_up, mid_hip, mid_sh)
-
-        # 4. 頸部角度 (Neck)
-        mid_ear = [(le_ear[0] + ri_ear[0]) / 2, (le_ear[1] + ri_ear[1]) / 2, (le_ear[2] + ri_ear[2]) / 2]
-        ang_neck = abs(180.0 - calculate_3d_angle(mid_hip, mid_sh, mid_ear))
-
-        s_nk, s_tk = get_neck_score(ang_neck), get_trunk_score(ang_trunk)
-        r_ua, r_la = get_upper_arm_score(ang_r_upper_arm), get_lower_arm_score(ang_r_lower_arm)
-        l_ua, l_la = get_upper_arm_score(ang_l_upper_arm), get_lower_arm_score(ang_l_lower_arm)
-
-        r_a, r_b, r_c, r_d, r_grand, r_al = compute_rula_full_score(r_ua, r_la, s_nk, s_tk, m_val, f_val)
-        l_a, l_b, l_c, l_d, l_grand, l_al = compute_rula_full_score(l_ua, l_la, s_nk, s_tk, m_val, f_val)
+        # 1. 前臂屈曲 (Lower Arm): 180 - 內角
+        ang_lower_arm = abs(180.0 - calculate_3d_angle(sh, el, wr))
         
-        worst_side = "右手側" if r_grand >= l_grand else "左手側"
-        final_grand = max(r_grand, l_grand)
-        final_al = r_al if r_grand >= l_grand else l_al
-
-        # 嚴格依照指定之欄位與變數字典
+        # 2. 上臂屈曲 (Upper Arm): 以軀幹主軸向量為基準線
+        trunk_vec = [hp[0] - sh[0], hp[1] - sh[1], hp[2] - sh[2]]
+        ref_sh_down = [sh[0] + trunk_vec[0], sh[1] + trunk_vec[1], sh[2] + trunk_vec[2]]
+        ang_upper_arm = calculate_3d_angle(ref_sh_down, sh, el)
+        
+        # 3. 軀幹前傾 (Trunk): 髖骨至肩膀與垂直線夾角
+        vertical_up = [hp[0], hp[1] - 1.0, hp[2]]
+        ang_trunk = calculate_3d_angle(vertical_up, hp, sh)
+        
+        # 4. 頸部前屈 (Neck): 相對於軀幹軸線
+        ang_neck = abs(180.0 - calculate_3d_angle(hp, sh, ear))
+        
+        # 整合正面鏡頭特徵進行評分
+        s_ua = get_upper_arm_score(ang_upper_arm, is_abducted=front_mods.get("is_abducted", False))
+        s_la = get_lower_arm_score(ang_lower_arm, is_across_midline=front_mods.get("is_across_midline", False))
+        s_tk = get_trunk_score(ang_trunk, is_side_bending=front_mods.get("is_side_bending", False))
+        s_nk = get_neck_score(ang_neck)
+        
+        sc_a, sc_b, sc_c, sc_d, grand, al = compute_rula_side_score(s_ua, s_la, s_nk, s_tk, m_val, f_val)
+        
+        side_prefix = "右手" if target_side == "右手側" else "左手"
         data = {
-            "頸部角度": round(ang_neck, 1), "軀幹角度": round(ang_trunk, 1),
-            "右上臂角度": round(ang_r_upper_arm, 1), "右前臂角度": round(ang_r_lower_arm, 1),
-            "左上臂角度": round(ang_l_upper_arm, 1), "左前臂角度": round(ang_l_lower_arm, 1),
-            "右手 Score A": r_a,
-            "右手 Score C": r_c,
-            "右手 Grand Score": r_grand,
-            "右手 AL": r_al,
-            "左手 Score A": l_a,
-            "左手 Score C": l_c,
-            "左手 Grand Score": l_grand,
-            "左手 AL": l_al,
-            "最危害側": worst_side,
-            "最終最高分": final_grand,
-            "最終 AL": final_al,
-            "Overall_Conf": overall_conf
+            "頸部角度": round(ang_neck, 1),
+            "軀幹角度": round(ang_trunk, 1),
+            f"{side_prefix}上臂角度": round(ang_upper_arm, 1),
+            f"{side_prefix}前臂角度": round(ang_lower_arm, 1),
+            f"{side_prefix}上臂外展補正": "是 (+1分)" if front_mods.get("is_abducted") else "否",
+            f"{side_prefix}橫越中線補正": "是 (+1分)" if front_mods.get("is_across_midline") else "否",
+            "軀幹側彎補正": "是 (+1分)" if front_mods.get("is_side_bending") else "否",
+            f"{side_prefix} Score A": sc_a,
+            f"{side_prefix} Score C": sc_c,
+            f"{side_prefix} Grand Score": grand,
+            f"{side_prefix} AL": al,
+            "最危害側": target_side,
+            "最終最高分": grand,
+            "最終 AL": al,
+            "Overall_Conf": conf_side
         }
-        return True, data, image, overall_conf
+        return True, data, frame_annotated, conf_side
     except Exception:
-        return False, None, image, 0.0  
+        return False, None, frame_annotated, 0.0
 
 
-# ==================== 【Streamlit 網頁版 UI】 ====================
-st.set_page_config(page_title="RULA 姿態評估系統", layout="wide")
-st.title("RULA AI 姿勢危害分析系統")
+# ==================== 【Streamlit 網頁應用介面】 ====================
+st.set_page_config(page_title="RULA 三視角人因工程 AI 評估系統", layout="wide")
+st.title("RULA 三視角 AI 姿勢危害評估系統")
+st.markdown("> **人因工程架構說明**：以側視角精準量測主要關節矢狀面屈曲角度；正面視角判定上臂外展、橫越中線與側彎等額外危害扣分項。")
 
-st.header("第一步：選擇拍攝視角影片")
-col1, col2 = st.columns(2)
-with col1:
-    vid1_file = st.file_uploader("選擇 [正面鏡頭] 影片", type=['mp4', 'mov', 'avi'])
-with col2:
-    vid2_file = st.file_uploader("選擇 [側面鏡頭] 影片 (可選)", type=['mp4', 'mov', 'avi'])
+# 選擇評估目標側
+target_side = st.radio(
+    "🎯 請選擇本次作業分析之【主要評估側】:",
+    options=["右手側", "左手側"],
+    index=0,
+    horizontal=True,
+    help="根據 RULA 規範，評估員應指定作業負擔較重、受力較大或主要操作之單側手部進行評級。"
+)
 
-st.header("第二步：等距抽樣與參數設定")
-num_samples = st.slider("抽樣照片張數", min_value=5, max_value=200, value=30)
+st.header("第一步：上傳視角影片")
+col_front, col_right, col_left = st.columns(3)
 
-col3, col4 = st.columns(2)
-with col3:
-    combo_muscle = st.selectbox("肌肉狀態 (Muscle):", ["0: 無維持超過1分鐘", "1: 姿勢維持>1分鐘/高頻率"])
-with col4:
-    combo_force = st.selectbox("荷重施力 (Force):", ["0: < 2kg (間歇)", "1: 2-10kg (間歇)", "2: 2-10kg (靜態/重複)", "2: 負載 > 10kg (間歇性)", "3: > 10kg"])
+with col_front:
+    vid_front_file = st.file_uploader("1. 正面鏡頭 (必填: 判定外展/交叉)", type=['mp4', 'mov', 'avi'])
+with col_right:
+    vid_right_file = st.file_uploader("2. 右側鏡頭 (量測右側動作)", type=['mp4', 'mov', 'avi'])
+with col_left:
+    vid_left_file = st.file_uploader("3. 左側鏡頭 (量測左側動作)", type=['mp4', 'mov', 'avi'])
 
-if st.button("🚀 啟動分析", type="primary", use_container_width=True):
-    if not vid1_file:
-        st.warning("請至少上傳第一支（正面鏡頭）影片！")
+st.header("第二步：等距抽樣與負載參數設定")
+col_p1, col_p2, col_p3 = st.columns(3)
+with col_p1:
+    num_samples = st.slider("等距抽樣張數", min_value=5, max_value=150, value=30)
+with col_p2:
+    combo_muscle = st.selectbox("肌肉使用分數 (Muscle Score):", ["0: 靜態少於1分鐘 / 偶發動作", "1: 姿勢維持>1分鐘 / 高重複作業"])
+with col_p3:
+    combo_force = st.selectbox("負載與施力 (Force/Load):", ["0: < 2kg (間歇施力)", "1: 2-10kg (間歇施力)", "2: 2-10kg (靜態/重複施力)", "3: > 10kg 或快速衝擊力"])
+
+# 執行分析
+if st.button("🚀 啟動多視角聯立分析", type="primary", use_container_width=True):
+    # 決定側視角影片來源
+    selected_side_vid = vid_right_file if target_side == "右手側" else vid_left_file
+    
+    if not vid_front_file:
+        st.error("❌ 缺少【正面鏡頭影片】！正面鏡頭是用於校正水平面外展與中線穿越的必要基準。")
+    elif not selected_side_vid:
+        st.error(f"❌ 缺少【{target_side}側面影片】！您選擇評估「{target_side}」，必須提供該側面的拍攝視角進行主屈曲量測。")
     else:
-        with st.spinner("系統分析中，請稍候..."):
-            tfile1 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            tfile1.write(vid1_file.read())
-            vid1_path = tfile1.name
+        with st.spinner(f"系統正在進行三視角聯立解算（目標：{target_side}）..."):
+            # 建立正面暫存
+            t_front = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+            t_front.write(vid_front_file.read())
+            cap_front = cv2.VideoCapture(t_front.name)
             
-            vid2_path = None
-            if vid2_file:
-                tfile2 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                tfile2.write(vid2_file.read())
-                vid2_path = tfile2.name
+            # 建立側面暫存
+            t_side = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+            t_side.write(selected_side_vid.read())
+            cap_side = cv2.VideoCapture(t_side.name)
 
-            m_val = int(combo_muscle.split(":")[0])
-            f_val = int(combo_force.split(":")[0])
-
-            cap1 = cv2.VideoCapture(vid1_path)
-            fps = cap1.get(cv2.CAP_PROP_FPS) or 30.0
-            total_frames = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            use_dual_cam = bool(vid2_path)
-            if use_dual_cam:
-                cap2 = cv2.VideoCapture(vid2_path)
-                total_frames = min(total_frames, int(cap2.get(cv2.CAP_PROP_FRAME_COUNT)))
+            fps = cap_side.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = min(int(cap_front.get(cv2.CAP_PROP_FRAME_COUNT)), int(cap_side.get(cv2.CAP_PROP_FRAME_COUNT)))
 
             if total_frames <= 0:
-                st.error("影片載入失敗或影格長度為 0！")
+                st.error("影片解析長度為 0，請檢查影片編碼格式！")
                 st.stop()
 
             sample_indices = np.linspace(0, total_frames - 1, num_samples, dtype=int).tolist()
 
-            raw_frames_1, raw_frames_2 = [], []
+            raw_front_frames, raw_side_frames = [], []
             for idx in sample_indices:
-                current_time_sec = round(idx / fps, 2)
-                cap1.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                succ1, f1 = cap1.read()
-                if succ1: raw_frames_1.append((current_time_sec, f1))
-                
-                if use_dual_cam:
-                    cap2.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    succ2, f2 = cap2.read()
-                    if succ2: raw_frames_2.append((current_time_sec, f2))
+                t_sec = round(idx / fps, 2)
+                cap_front.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                cap_side.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                s_f, f_img = cap_front.read()
+                s_s, s_img = cap_side.read()
+                if s_f and s_s:
+                    raw_front_frames.append((t_sec, f_img))
+                    raw_side_frames.append((t_sec, s_img))
 
-            cap1.release()
-            if use_dual_cam: cap2.release()
+            cap_front.release()
+            cap_side.release()
+
+            m_val = int(combo_muscle.split(":")[0])
+            f_val = int(combo_force.split(":")[0])
 
             records = []
             zip_images = []
@@ -280,64 +348,53 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            with mp.solutions.pose.Pose(
-                static_image_mode=True, 
-                model_complexity=1, 
-                min_detection_confidence=0.6
-            ) as pose:
-                total_samples = len(raw_frames_1)
+            with mp.solutions.pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.6) as pose:
+                total_samples = len(raw_side_frames)
                 for i in range(total_samples):
-                    sec, frame1 = raw_frames_1[i]
-                    
-                    succ_1, data_1, img_1, conf_1 = analyze_image(frame1, pose, m_val, f_val)
-                    best_data, best_img, best_cam_label, best_conf = data_1, img_1, "正面/鏡頭 A", conf_1
-                    
-                    if use_dual_cam and i < len(raw_frames_2):
-                        _, frame2 = raw_frames_2[i]
-                        succ_2, data_2, img_2, conf_2 = analyze_image(frame2, pose, m_val, f_val)
-                        
-                        if succ_2 and conf_2 > conf_1:
-                            best_data, best_img, best_cam_label, best_conf = data_2, img_2, "側面/鏡頭 B", conf_2
-                    
-                    if best_data is not None:
-                        final_record = {
-                            "樣本編號": i + 1, 
-                            "時間(秒)": sec, 
-                            "最佳視角來源": best_cam_label, 
-                            "最佳綜合信賴度(%)": round(best_conf, 1)
-                        }
-                        final_record.update(best_data)
-                        final_record.pop('Overall_Conf', None)
-                        records.append(final_record)
-                        
-                        # 標註圖片文字
-                        best_img = put_chinese_text(best_img, f"時間: {sec}秒 | {best_data['最危害側']}高風險", (15, 15), (0, 255, 255), 18)
-                        best_img = put_chinese_text(best_img, f"最終最高分: {best_data['最終最高分']} 分 | {best_data['最終 AL']}", (15, 45), (0, 0, 255) if best_data['最終最高分'] > 4 else (0, 255, 0), 16)
-                        best_img = put_chinese_text(best_img, f"採用視角: {best_cam_label} (信賴度: {best_conf:.1f}%)", (15, 75), (255, 150, 0), 14)
-                        
-                        is_success, buffer = cv2.imencode(".jpg", best_img)
-                        if is_success:
-                            zip_images.append((f"Sample_{i+1:03d}_{sec}s_BestCam.jpg", buffer.tobytes()))
-                    
-                    progress_bar.progress((i + 1) / total_samples)
-                    status_text.text(f"影像辨識進度: {i+1} / {total_samples} 筆完成")
+                    sec, f_frame = raw_front_frames[i]
+                    _, s_frame = raw_side_frames[i]
 
-            # 打包 ZIP
+                    # 1. 先用正面鏡頭判斷外展/交叉特徵
+                    succ_f, front_mods, _ = analyze_front_camera(f_frame, pose, target_side)
+                    
+                    # 2. 側視角結合特徵進行 RULA 核心解算
+                    succ_s, data, side_annotated, conf = analyze_side_camera(s_frame, pose, target_side, front_mods, m_val, f_val)
+
+                    if succ_s and data is not None:
+                        record = {
+                            "樣本編號": i + 1,
+                            "時間(秒)": sec,
+                            "主要評估側": target_side,
+                            "視角信賴度(%)": round(conf, 1)
+                        }
+                        record.update(data)
+                        records.append(record)
+
+                        # 在影像上標註數據
+                        side_annotated = put_chinese_text(side_annotated, f"時間: {sec}s | 目標: {target_side}", (15, 15), (0, 255, 255), 18)
+                        side_annotated = put_chinese_text(side_annotated, f"Grand Score: {data['最終最高分']} 分 ({data['最終 AL']})", (15, 45), (0, 0, 255) if data['最終最高分'] > 4 else (0, 255, 0), 16)
+                        side_annotated = put_chinese_text(side_annotated, f"正面補正: 外展({data[f'{target_side[:2]}上臂外展補正']}) | 交叉({data[f'{target_side[:2]}橫越中線補正']})", (15, 75), (255, 150, 0), 14)
+
+                        is_ok, buf = cv2.imencode(".jpg", side_annotated)
+                        if is_ok:
+                            zip_images.append((f"Sample_{i+1:03d}_{sec}s_{target_side}.jpg", buf.tobytes()))
+
+                    progress_bar.progress((i + 1) / total_samples)
+                    status_text.text(f"多視角姿態解算進度: {i+1} / {total_samples} 筆完成")
+
+            # 打包成下載 ZIP
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w') as zf:
                 if records:
                     df = pd.DataFrame(records)
-                    csv_bytes = df.to_csv(index=False).encode('utf-8-sig')
-                    zf.writestr("RULA統計報表.csv", csv_bytes)
-                
-                for filename, img_bytes in zip_images:
-                    zf.writestr(f"照片庫/{filename}", img_bytes)
-            
-            st.success("✅ 分析完成！請點擊下方按鈕下載完整數據與照片。")
-            
+                    zf.writestr("RULA多視角分析報表.csv", df.to_csv(index=False).encode('utf-8-sig'))
+                for fname, fbytes in zip_images:
+                    zf.writestr(f"標註照片庫/{fname}", fbytes)
+
+            st.success("✅ 多視角解算完成！請下載完整 RULA 稽核報表。")
             st.download_button(
-                label="📦 下載 RULA 稽核報表 (ZIP)",
+                label=f"📦 下載 {target_side} RULA 分析報告 (ZIP)",
                 data=zip_buffer.getvalue(),
-                file_name=f"MultiCam_RULA_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                file_name=f"RULA_{target_side}_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
                 mime="application/zip"
             )
