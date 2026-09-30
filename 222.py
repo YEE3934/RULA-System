@@ -282,7 +282,7 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
 
             with mp.solutions.pose.Pose(
                 static_image_mode=True, 
-                model_complexity=2, 
+                model_complexity=1, 
                 min_detection_confidence=0.6
             ) as pose:
                 total_samples = len(raw_frames_1)
