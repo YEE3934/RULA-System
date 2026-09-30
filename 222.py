@@ -68,11 +68,38 @@ def calculate_3d_angle(a, b, c):
     if norm_ba == 0 or norm_bc == 0: return 0.0
     return np.degrees(np.arccos(np.clip(np.dot(ba, bc) / (norm_ba * norm_bc), -1.0, 1.0)))
 
+def calculate_anatomical_angle(hip, shoulder, elbow):
+    """正統 RULA 解剖學角度計算：以軀幹 (肩膀到骨盆) 為 0 度基準線"""
+    vector_trunk = np.array([hip[0] - shoulder[0], hip[1] - shoulder[1], hip[2] - shoulder[2]])
+    vector_arm = np.array([elbow[0] - shoulder[0], elbow[1] - shoulder[1], elbow[2] - shoulder[2]])
+    norm_trunk = np.linalg.norm(vector_trunk)
+    norm_arm = np.linalg.norm(vector_arm)
+    if norm_trunk == 0 or norm_arm == 0: return 0.0
+    dot_product = np.dot(vector_trunk, vector_arm)
+    return np.degrees(np.arccos(np.clip(dot_product / (norm_trunk * norm_arm), -1.0, 1.0)))
+
 def put_chinese_text(img, text, position, color, size=15):
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
-    try: font = ImageFont.truetype("msjh.ttc", size)
-    except: font = ImageFont.load_default()
+    
+    font = None
+    # 支援 Linux 雲端字型庫與本機 Windows 微軟正黑體
+    font_paths = [
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "msjh.ttc",
+        "simhei.ttf"
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            try:
+                font = ImageFont.truetype(path, size)
+                break
+            except Exception:
+                pass
+                
+    if font is None:
+        font = ImageFont.load_default()
+        
     draw.text(position, text, fill=(color[2], color[1], color[0]), font=font)
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
@@ -99,37 +126,41 @@ def analyze_image(frame, pose_model, m_val, f_val):
         conf_l_arm = round((n_lm[23].visibility + n_lm[11].visibility + n_lm[13].visibility + n_lm[15].visibility) / 4 * 100, 1)
         overall_conf = (conf_neck + conf_r_arm + conf_l_arm) / 3 
 
+        # 幾何合理性審查 (防禦正面彎腰透視變形)
         shoulder_width_2d = abs(n_lm[11].x - n_lm[12].x)
         trunk_length_2d = math.hypot(((n_lm[11].x + n_lm[12].x) / 2) - ((n_lm[23].x + n_lm[24].x) / 2),
                                      ((n_lm[11].y + n_lm[12].y) / 2) - ((n_lm[23].y + n_lm[24].y) / 2))
         if trunk_length_2d > 0 and shoulder_width_2d > trunk_length_2d * 0.8: 
             overall_conf = overall_conf * 0.5 
 
-        ls, rs = [w_lm[11].x, w_lm[11].y, w_lm[11].z], [w_lm[12].x, w_lm[12].y, w_lm[12].z]
-        le, re = [w_lm[13].x, w_lm[13].y, w_lm[13].z], [w_lm[14].x, w_lm[14].y, w_lm[14].z]
-        lw, rw = [w_lm[15].x, w_lm[15].y, w_lm[15].z], [w_lm[16].x, w_lm[16].y, w_lm[16].z]
-        lh, rh = [w_lm[23].x, w_lm[23].y, w_lm[23].z], [w_lm[24].x, w_lm[24].y, w_lm[24].z]
-        le_ear, ri_ear = [w_lm[7].x, w_lm[7].y, w_lm[7].z], [w_lm[8].x, w_lm[8].y, w_lm[8].z]
+        # 抓取投影點 (Z軸設為 0 以進行平面解剖投影計算)
+        ls, rs = [w_lm[11].x, w_lm[11].y, 0], [w_lm[12].x, w_lm[12].y, 0]
+        le, re = [w_lm[13].x, w_lm[13].y, 0], [w_lm[14].x, w_lm[14].y, 0]
+        lw, rw = [w_lm[15].x, w_lm[15].y, 0], [w_lm[16].x, w_lm[16].y, 0]
+        lh, rh = [w_lm[23].x, w_lm[23].y, 0], [w_lm[24].x, w_lm[24].y, 0]
+        le_ear, ri_ear = [w_lm[7].x, w_lm[7].y, 0], [w_lm[8].x, w_lm[8].y, 0]
 
-        ang_r_elb = abs(180 - calculate_3d_angle(rs, re, rw))
-        ang_l_elb = abs(180 - calculate_3d_angle(ls, le, lw))
+        # 1. 下臂彎曲 (Lower Arm / Elbow)
+        ang_r_lower_arm = abs(180 - calculate_3d_angle(rs, re, rw))
+        ang_l_lower_arm = abs(180 - calculate_3d_angle(ls, le, lw))
 
-        r_sh_down = [rs[0], rs[1] + 1.0, rs[2]]
-        l_sh_down = [ls[0], ls[1] + 1.0, ls[2]]
-        ang_r_sh = calculate_3d_angle(r_sh_down, rs, re)
-        ang_l_sh = calculate_3d_angle(l_sh_down, ls, le)
+        # 2. 上臂屈曲 (Upper Arm): 解剖學定義，相對於軀幹軸線
+        ang_r_upper_arm = calculate_anatomical_angle(rh, rs, re)
+        ang_l_upper_arm = calculate_anatomical_angle(lh, ls, le)
 
+        # 3. 軀幹彎曲 (Trunk): 相對於骨盆絕對垂直線
         mid_sh = [(ls[0]+rs[0])/2, (ls[1]+rs[1])/2, (ls[2]+rs[2])/2]
         mid_hip = [(lh[0]+rh[0])/2, (lh[1]+rh[1])/2, (lh[2]+rh[2])/2]
         hip_up = [mid_hip[0], mid_hip[1] - 1.0, mid_hip[2]] 
         ang_trunk = calculate_3d_angle(hip_up, mid_hip, mid_sh)
 
+        # 4. 頸部彎曲 (Neck): 相對於軀幹軸線
         mid_ear = [(le_ear[0]+ri_ear[0])/2, (le_ear[1]+ri_ear[1])/2, (le_ear[2]+ri_ear[2])/2]
         ang_neck = abs(180 - calculate_3d_angle(mid_hip, mid_sh, mid_ear))
 
         s_nk, s_tk = get_neck_score(ang_neck), get_trunk_score(ang_trunk)
-        r_ua, r_la = get_upper_arm_score(ang_r_sh), get_lower_arm_score(ang_r_elb)
-        l_ua, l_la = get_upper_arm_score(ang_l_sh), get_lower_arm_score(ang_l_elb)
+        r_ua, r_la = get_upper_arm_score(ang_r_upper_arm), get_lower_arm_score(ang_r_lower_arm)
+        l_ua, l_la = get_upper_arm_score(ang_l_upper_arm), get_lower_arm_score(ang_l_lower_arm)
 
         r_a, r_b, r_c, r_d, r_grand, r_al = compute_rula_full_score(r_ua, r_la, s_nk, s_tk, m_val, f_val)
         l_a, l_b, l_c, l_d, l_grand, l_al = compute_rula_full_score(l_ua, l_la, s_nk, s_tk, m_val, f_val)
@@ -140,19 +171,23 @@ def analyze_image(frame, pose_model, m_val, f_val):
 
         data = {
             "頸部角度": round(ang_neck, 1), "軀幹角度": round(ang_trunk, 1),
-            "右肩角度": round(ang_r_sh, 1), "右手肘角": round(ang_r_elb, 1),
-            "左肩角度": round(ang_l_sh, 1), "左手肘角": round(ang_l_elb, 1),
+            "右上臂角度": round(ang_r_upper_arm, 1), "右前臂角度": round(ang_r_lower_arm, 1),
+            "左上臂角度": round(ang_l_upper_arm, 1), "左前臂角度": round(ang_l_lower_arm, 1),
+            "右手 Score A": r_a,
+            "右手 Score C": r_c,
+            "右手 Grand Score": r_grand,
+            "右手 AL": r_al,
+            "左手 Score A": l_a,
+            "左手 Score C": l_c,
+            "左手 Grand Score": l_grand,
+            "左手 AL": l_al,
             "最危害側": worst_side,
-            "Score A": r_a if worst_side=="右手側" else l_a,
-            "Score B": r_b if worst_side=="右手側" else l_b,
-            "Score C": r_c if worst_side=="右手側" else l_c,
-            "Score D": r_d if worst_side=="右手側" else l_d,
-            "Grand Score": final_grand,
-            "AL": final_al,
+            "最終最高分": final_grand,
+            "最終 AL": final_al,
             "Overall_Conf": overall_conf
         }
         return True, data, image, overall_conf
-    except Exception as e:
+    except Exception:
         return False, None, image, 0.0  
 
 
@@ -180,9 +215,8 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
     if not vid1_file:
         st.warning("請至少上傳第一支（正面鏡頭）影片！")
     else:
-        # ==================== 【主程式：等距截圖與 Sensor Fusion】 ====================
         with st.spinner("影片處理與分析中，請稍候..."):
-            # 將上傳的影片存入虛擬暫存檔，讓 cv2 可以讀取
+            # 建立虛擬暫存檔讓 OpenCV 讀取
             tfile1 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
             tfile1.write(vid1_file.read())
             vid1_path = tfile1.name
@@ -220,7 +254,8 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
                     if succ2: raw_frames_2.append((current_time_sec, f2))
 
             cap1.release()
-            if use_dual_cam: cap2.release()
+            if use_dual_cam: 
+                cap2.release()
 
             records = []
             zip_images = []
@@ -249,8 +284,9 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
                         final_record.pop('Overall_Conf', None)
                         records.append(final_record)
                         
+                        # 標註辨識結果在圖片上
                         best_img = put_chinese_text(best_img, f"時間: {sec}秒 | {best_data['最危害側']}高風險", (15, 15), (0, 255, 255), 18)
-                        best_img = put_chinese_text(best_img, f"總分: {best_data['Grand Score']} 分 | {best_data['AL']}", (15, 45), (0, 0, 255) if best_data['Grand Score'] > 4 else (0,255,0), 16)
+                        best_img = put_chinese_text(best_img, f"總分: {best_data['最終最高分']} 分 | {best_data['最終 AL']}", (15, 45), (0, 0, 255) if best_data['最終最高分'] > 4 else (0, 255, 0), 16)
                         best_img = put_chinese_text(best_img, f"🏆 採用畫面: {best_cam_label} (信賴度: {best_conf:.1f}%)", (15, 75), (255, 150, 0), 14)
                         
                         is_success, buffer = cv2.imencode(".jpg", best_img)
