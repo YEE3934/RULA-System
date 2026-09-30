@@ -48,54 +48,59 @@ TABLE_C = [
 ]
 
 # ==================== 【核心判定與幾何計算】 ====================
-def get_upper_arm_score(angle): return 1 if angle <= 20 else (2 if angle <= 45 else (3 if angle <= 90 else 4))
-def get_lower_arm_score(angle): return 1 if 60 <= angle <= 100 else 2
-def get_neck_score(angle): return 1 if angle <= 10 else (2 if angle <= 20 else 3)
-def get_trunk_score(angle): return 1 if angle <= 5 else (2 if angle <= 20 else (3 if angle <= 60 else 4))
+def get_upper_arm_score(angle): 
+    return 1 if angle <= 20 else (2 if angle <= 45 else (3 if angle <= 90 else 4))
+
+def get_lower_arm_score(angle): 
+    return 1 if 60 <= angle <= 100 else 2
+
+def get_neck_score(angle): 
+    return 1 if angle <= 10 else (2 if angle <= 20 else 3)
+
+def get_trunk_score(angle): 
+    return 1 if angle <= 5 else (2 if angle <= 20 else (3 if angle <= 60 else 4))
 
 def compute_rula_full_score(upper_arm, lower_arm, neck, trunk, muscle_val, force_val):
     ua, la, w, wt = min(max(upper_arm, 1), 6), min(max(lower_arm, 1), 3), 1, 1
     nk, tk, lg = min(max(neck, 1), 6), min(max(trunk, 1), 6), 1
-    score_a, score_b = TABLE_A[ua][la][w][wt], TABLE_B[nk][tk][lg]
-    score_c, score_d = score_a + muscle_val + force_val, score_b + muscle_val + force_val
+    score_a = TABLE_A[ua][la][w][wt]
+    score_b = TABLE_B[nk][tk][lg]
+    score_c = score_a + muscle_val + force_val
+    score_d = score_b + muscle_val + force_val
     grand_score = TABLE_C[min(score_c, 8) - 1][min(score_d, 7) - 1]
     al_num = 1 if grand_score <= 2 else (2 if grand_score <= 4 else (3 if grand_score <= 6 else 4))
     return score_a, score_b, score_c, score_d, grand_score, f"AL{al_num}"
 
 def calculate_3d_angle(a, b, c):
-    ba, bc = np.array(a) - np.array(b), np.array(c) - np.array(b)
-    norm_ba, norm_bc = np.linalg.norm(ba), np.linalg.norm(bc)
-    if norm_ba == 0 or norm_bc == 0: return 0.0
-    return np.degrees(np.arccos(np.clip(np.dot(ba, bc) / (norm_ba * norm_bc), -1.0, 1.0)))
-
-def calculate_anatomical_angle(hip, shoulder, elbow):
-    """正統 RULA 解剖學角度計算：以軀幹 (肩膀到骨盆) 為 0 度基準線"""
-    vector_trunk = np.array([hip[0] - shoulder[0], hip[1] - shoulder[1], hip[2] - shoulder[2]])
-    vector_arm = np.array([elbow[0] - shoulder[0], elbow[1] - shoulder[1], elbow[2] - shoulder[2]])
-    norm_trunk = np.linalg.norm(vector_trunk)
-    norm_arm = np.linalg.norm(vector_arm)
-    if norm_trunk == 0 or norm_arm == 0: return 0.0
-    dot_product = np.dot(vector_trunk, vector_arm)
-    return np.degrees(np.arccos(np.clip(dot_product / (norm_trunk * norm_arm), -1.0, 1.0)))
+    ba = np.array(a) - np.array(b)
+    bc = np.array(c) - np.array(b)
+    norm_ba = np.linalg.norm(ba)
+    norm_bc = np.linalg.norm(bc)
+    if norm_ba == 0 or norm_bc == 0: 
+        return 0.0
+    cosine = np.clip(np.dot(ba, bc) / (norm_ba * norm_bc), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosine)))
 
 def put_chinese_text(img, text, position, color, size=15):
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
     
     font = None
-    # 支援 Linux 雲端字型庫與本機 Windows 微軟正黑體
-    font_paths = [
+    font_candidates = [
+        "font.ttf",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "msjh.ttc",
         "simhei.ttf"
     ]
-    for path in font_paths:
-        if os.path.exists(path):
+    for p in font_candidates:
+        if os.path.exists(p):
             try:
-                font = ImageFont.truetype(path, size)
+                font = ImageFont.truetype(p, size)
                 break
             except Exception:
-                pass
+                continue
                 
     if font is None:
         font = ImageFont.load_default()
@@ -113,7 +118,7 @@ def analyze_image(frame, pose_model, m_val, f_val):
     results = pose_model.process(image)
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     
-    if not results.pose_world_landmarks:
+    if not results.pose_world_landmarks or not results.pose_landmarks:
         return False, None, image, 0.0
         
     mp.solutions.drawing_utils.draw_landmarks(image, results.pose_landmarks, mp.solutions.pose.POSE_CONNECTIONS)
@@ -121,42 +126,51 @@ def analyze_image(frame, pose_model, m_val, f_val):
     n_lm = results.pose_landmarks.landmark
     
     try:
-        conf_neck = round((n_lm[7].visibility + n_lm[8].visibility + n_lm[11].visibility + n_lm[12].visibility) / 4 * 100, 1)
-        conf_r_arm = round((n_lm[24].visibility + n_lm[12].visibility + n_lm[14].visibility + n_lm[16].visibility) / 4 * 100, 1)
-        conf_l_arm = round((n_lm[23].visibility + n_lm[11].visibility + n_lm[13].visibility + n_lm[15].visibility) / 4 * 100, 1)
+        conf_neck = (n_lm[7].visibility + n_lm[8].visibility + n_lm[11].visibility + n_lm[12].visibility) / 4 * 100
+        conf_r_arm = (n_lm[24].visibility + n_lm[12].visibility + n_lm[14].visibility + n_lm[16].visibility) / 4 * 100
+        conf_l_arm = (n_lm[23].visibility + n_lm[11].visibility + n_lm[13].visibility + n_lm[15].visibility) / 4 * 100
         overall_conf = (conf_neck + conf_r_arm + conf_l_arm) / 3 
 
-        # 幾何合理性審查 (防禦正面彎腰透視變形)
+        core_visibilities = [n_lm[11].visibility, n_lm[12].visibility, n_lm[23].visibility, n_lm[24].visibility]
+        if min(core_visibilities) < 0.35:
+            overall_conf *= 0.3
+
         shoulder_width_2d = abs(n_lm[11].x - n_lm[12].x)
         trunk_length_2d = math.hypot(((n_lm[11].x + n_lm[12].x) / 2) - ((n_lm[23].x + n_lm[24].x) / 2),
                                      ((n_lm[11].y + n_lm[12].y) / 2) - ((n_lm[23].y + n_lm[24].y) / 2))
-        if trunk_length_2d > 0 and shoulder_width_2d > trunk_length_2d * 0.8: 
-            overall_conf = overall_conf * 0.5 
+        if trunk_length_2d > 0 and shoulder_width_2d > trunk_length_2d * 0.85: 
+            overall_conf *= 0.5 
 
-        # 抓取投影點 (Z軸設為 0 以進行平面解剖投影計算)
-        ls, rs = [w_lm[11].x, w_lm[11].y, 0], [w_lm[12].x, w_lm[12].y, 0]
-        le, re = [w_lm[13].x, w_lm[13].y, 0], [w_lm[14].x, w_lm[14].y, 0]
-        lw, rw = [w_lm[15].x, w_lm[15].y, 0], [w_lm[16].x, w_lm[16].y, 0]
-        lh, rh = [w_lm[23].x, w_lm[23].y, 0], [w_lm[24].x, w_lm[24].y, 0]
-        le_ear, ri_ear = [w_lm[7].x, w_lm[7].y, 0], [w_lm[8].x, w_lm[8].y, 0]
+        ls, rs = [w_lm[11].x, w_lm[11].y, w_lm[11].z], [w_lm[12].x, w_lm[12].y, w_lm[12].z]
+        le, re = [w_lm[13].x, w_lm[13].y, w_lm[13].z], [w_lm[14].x, w_lm[14].y, w_lm[14].z]
+        lw, rw = [w_lm[15].x, w_lm[15].y, w_lm[15].z], [w_lm[16].x, w_lm[16].y, w_lm[16].z]
+        lh, rh = [w_lm[23].x, w_lm[23].y, w_lm[23].z], [w_lm[24].x, w_lm[24].y, w_lm[24].z]
+        le_ear, ri_ear = [w_lm[7].x, w_lm[7].y, w_lm[7].z], [w_lm[8].x, w_lm[8].y, w_lm[8].z]
 
-        # 1. 下臂彎曲 (Lower Arm / Elbow)
-        ang_r_lower_arm = abs(180 - calculate_3d_angle(rs, re, rw))
-        ang_l_lower_arm = abs(180 - calculate_3d_angle(ls, le, lw))
+        # 1. 前臂角度 (Lower Arm)
+        ang_r_lower_arm = abs(180.0 - calculate_3d_angle(rs, re, rw))
+        ang_l_lower_arm = abs(180.0 - calculate_3d_angle(ls, le, lw))
 
-        # 2. 上臂屈曲 (Upper Arm): 解剖學定義，相對於軀幹軸線
-        ang_r_upper_arm = calculate_anatomical_angle(rh, rs, re)
-        ang_l_upper_arm = calculate_anatomical_angle(lh, ls, le)
+        # 2. 上臂角度 (Upper Arm)
+        mid_sh = [(ls[0] + rs[0]) / 2, (ls[1] + rs[1]) / 2, (ls[2] + rs[2]) / 2]
+        mid_hip = [(lh[0] + rh[0]) / 2, (lh[1] + rh[1]) / 2, (lh[2] + rh[2]) / 2]
+        
+        trunk_dir_r = [rh[0] - rs[0], rh[1] - rs[1], rh[2] - rs[2]]
+        trunk_dir_l = [lh[0] - ls[0], lh[1] - ls[1], lh[2] - ls[2]]
+        
+        ref_r_point = [rs[0] + trunk_dir_r[0], rs[1] + trunk_dir_r[1], rs[2] + trunk_dir_r[2]]
+        ref_l_point = [ls[0] + trunk_dir_l[0], ls[1] + trunk_dir_l[1], ls[2] + trunk_dir_l[2]]
+        
+        ang_r_upper_arm = calculate_3d_angle(ref_r_point, rs, re)
+        ang_l_upper_arm = calculate_3d_angle(ref_l_point, ls, le)
 
-        # 3. 軀幹彎曲 (Trunk): 相對於骨盆絕對垂直線
-        mid_sh = [(ls[0]+rs[0])/2, (ls[1]+rs[1])/2, (ls[2]+rs[2])/2]
-        mid_hip = [(lh[0]+rh[0])/2, (lh[1]+rh[1])/2, (lh[2]+rh[2])/2]
-        hip_up = [mid_hip[0], mid_hip[1] - 1.0, mid_hip[2]] 
-        ang_trunk = calculate_3d_angle(hip_up, mid_hip, mid_sh)
+        # 3. 軀幹角度 (Trunk)
+        hip_vertical_up = [mid_hip[0], mid_hip[1] - 1.0, mid_hip[2]] 
+        ang_trunk = calculate_3d_angle(hip_vertical_up, mid_hip, mid_sh)
 
-        # 4. 頸部彎曲 (Neck): 相對於軀幹軸線
-        mid_ear = [(le_ear[0]+ri_ear[0])/2, (le_ear[1]+ri_ear[1])/2, (le_ear[2]+ri_ear[2])/2]
-        ang_neck = abs(180 - calculate_3d_angle(mid_hip, mid_sh, mid_ear))
+        # 4. 頸部角度 (Neck)
+        mid_ear = [(le_ear[0] + ri_ear[0]) / 2, (le_ear[1] + ri_ear[1]) / 2, (le_ear[2] + ri_ear[2]) / 2]
+        ang_neck = abs(180.0 - calculate_3d_angle(mid_hip, mid_sh, mid_ear))
 
         s_nk, s_tk = get_neck_score(ang_neck), get_trunk_score(ang_trunk)
         r_ua, r_la = get_upper_arm_score(ang_r_upper_arm), get_lower_arm_score(ang_r_lower_arm)
@@ -169,6 +183,7 @@ def analyze_image(frame, pose_model, m_val, f_val):
         final_grand = max(r_grand, l_grand)
         final_al = r_al if r_grand >= l_grand else l_al
 
+        # 嚴格依照指定之欄位與變數字典
         data = {
             "頸部角度": round(ang_neck, 1), "軀幹角度": round(ang_trunk, 1),
             "右上臂角度": round(ang_r_upper_arm, 1), "右前臂角度": round(ang_r_lower_arm, 1),
@@ -192,7 +207,7 @@ def analyze_image(frame, pose_model, m_val, f_val):
 
 
 # ==================== 【Streamlit 網頁版 UI】 ====================
-st.set_page_config(page_title="RULA 系統", layout="wide")
+st.set_page_config(page_title="RULA 姿態評估系統", layout="wide")
 st.title("RULA AI 姿勢危害分析系統")
 
 st.header("第一步：選擇拍攝視角影片")
@@ -203,7 +218,7 @@ with col2:
     vid2_file = st.file_uploader("選擇 [側面鏡頭] 影片 (可選)", type=['mp4', 'mov', 'avi'])
 
 st.header("第二步：等距抽樣與參數設定")
-num_samples = st.slider("抽樣照片張數", min_value=5, max_value=200, value=50)
+num_samples = st.slider("抽樣照片張數", min_value=5, max_value=200, value=30)
 
 col3, col4 = st.columns(2)
 with col3:
@@ -215,8 +230,7 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
     if not vid1_file:
         st.warning("請至少上傳第一支（正面鏡頭）影片！")
     else:
-        with st.spinner("影片處理與分析中，請稍候..."):
-            # 建立虛擬暫存檔讓 OpenCV 讀取
+        with st.spinner("系統分析中，請稍候..."):
             tfile1 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
             tfile1.write(vid1_file.read())
             vid1_path = tfile1.name
@@ -231,13 +245,17 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
             f_val = int(combo_force.split(":")[0])
 
             cap1 = cv2.VideoCapture(vid1_path)
-            fps = cap1.get(cv2.CAP_PROP_FPS)
+            fps = cap1.get(cv2.CAP_PROP_FPS) or 30.0
             total_frames = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
 
             use_dual_cam = bool(vid2_path)
             if use_dual_cam:
                 cap2 = cv2.VideoCapture(vid2_path)
                 total_frames = min(total_frames, int(cap2.get(cv2.CAP_PROP_FRAME_COUNT)))
+
+            if total_frames <= 0:
+                st.error("影片載入失敗或影格長度為 0！")
+                st.stop()
 
             sample_indices = np.linspace(0, total_frames - 1, num_samples, dtype=int).tolist()
 
@@ -254,8 +272,7 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
                     if succ2: raw_frames_2.append((current_time_sec, f2))
 
             cap1.release()
-            if use_dual_cam: 
-                cap2.release()
+            if use_dual_cam: cap2.release()
 
             records = []
             zip_images = []
@@ -263,7 +280,11 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            with mp.solutions.pose.Pose(static_image_mode=True, min_detection_confidence=0.7) as pose:
+            with mp.solutions.pose.Pose(
+                static_image_mode=True, 
+                model_complexity=2, 
+                min_detection_confidence=0.6
+            ) as pose:
                 total_samples = len(raw_frames_1)
                 for i in range(total_samples):
                     sec, frame1 = raw_frames_1[i]
@@ -279,15 +300,20 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
                             best_data, best_img, best_cam_label, best_conf = data_2, img_2, "側面/鏡頭 B", conf_2
                     
                     if best_data is not None:
-                        final_record = {"樣本編號": i + 1, "時間(秒)": sec, "最佳視角來源": best_cam_label, "最佳綜合信賴度(%)": round(best_conf, 1)}
+                        final_record = {
+                            "樣本編號": i + 1, 
+                            "時間(秒)": sec, 
+                            "最佳視角來源": best_cam_label, 
+                            "最佳綜合信賴度(%)": round(best_conf, 1)
+                        }
                         final_record.update(best_data)
                         final_record.pop('Overall_Conf', None)
                         records.append(final_record)
                         
-                        # 標註辨識結果在圖片上
+                        # 標註圖片文字
                         best_img = put_chinese_text(best_img, f"時間: {sec}秒 | {best_data['最危害側']}高風險", (15, 15), (0, 255, 255), 18)
-                        best_img = put_chinese_text(best_img, f"總分: {best_data['最終最高分']} 分 | {best_data['最終 AL']}", (15, 45), (0, 0, 255) if best_data['最終最高分'] > 4 else (0, 255, 0), 16)
-                        best_img = put_chinese_text(best_img, f"🏆 採用畫面: {best_cam_label} (信賴度: {best_conf:.1f}%)", (15, 75), (255, 150, 0), 14)
+                        best_img = put_chinese_text(best_img, f"最終最高分: {best_data['最終最高分']} 分 | {best_data['最終 AL']}", (15, 45), (0, 0, 255) if best_data['最終最高分'] > 4 else (0, 255, 0), 16)
+                        best_img = put_chinese_text(best_img, f"採用視角: {best_cam_label} (信賴度: {best_conf:.1f}%)", (15, 75), (255, 150, 0), 14)
                         
                         is_success, buffer = cv2.imencode(".jpg", best_img)
                         if is_success:
@@ -296,7 +322,7 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
                     progress_bar.progress((i + 1) / total_samples)
                     status_text.text(f"影像辨識進度: {i+1} / {total_samples} 筆完成")
 
-            # ==================== 【主程式：打包 ZIP 提供下載】 ====================
+            # 打包 ZIP
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w') as zf:
                 if records:
