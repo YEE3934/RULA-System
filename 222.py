@@ -273,11 +273,11 @@ if st.button("🚀 啟動分析", type="primary", use_container_width=True):
                 for filename, img_bytes in zip_images:
                     zf.writestr(f"照片庫/{filename}", img_bytes)
             
-            st.success("✅ 分析完成！請點擊下方按鈕下載完整數據與照片。")
+            st.success(" 分析完成！請點擊下方按鈕下載完整數據與照片。")
             
             # 顯示下載按鈕
             st.download_button(
-                label="📦 下載 RULA 稽核報表 (ZIP)",
+                label=" 下載 RULA 稽核報表 (ZIP)",
                 data=zip_buffer.getvalue(),
                 file_name=f"MultiCam_RULA_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zi
+                mime="application/zip"
