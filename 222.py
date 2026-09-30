@@ -264,12 +264,12 @@ def analyze_side_camera(frame, pose_model, target_side, front_mods, m_val, f_val
 
 # ==================== 【Streamlit 網頁應用介面】 ====================
 st.set_page_config(page_title="RULA 三視角人因工程 AI 評估系統", layout="wide")
-st.title("RULA 三視角 AI 姿勢危害評估系統")
-st.markdown("> **人因工程架構說明**：以側視角精準量測主要關節矢狀面屈曲角度；正面視角判定上臂外展、橫越中線與側彎等額外危害扣分項。")
+st.title("RULA 姿勢危害評估系統")
+st.markdown("> **人因工程架構說明**：以側視角量測主要關節屈曲角度；正面視角判定上臂外展、橫越中線與側彎等額外危害扣分項。")
 
 # 選擇評估目標側
 target_side = st.radio(
-    "🎯 請選擇本次作業分析之【主要評估側】:",
+    " 請選擇本次作業分析之【主要評估側】:",
     options=["右手側", "左手側"],
     index=0,
     horizontal=True,
@@ -296,7 +296,7 @@ with col_p3:
     combo_force = st.selectbox("負載與施力 (Force/Load):", ["0: < 2kg (間歇施力)", "1: 2-10kg (間歇施力)", "2: 2-10kg (靜態/重複施力)", "3: > 10kg 或快速衝擊力"])
 
 # 執行分析
-if st.button("🚀 啟動多視角聯立分析", type="primary", use_container_width=True):
+if st.button(" 啟動分析", type="primary", use_container_width=True):
     # 決定側視角影片來源
     selected_side_vid = vid_right_file if target_side == "右手側" else vid_left_file
     
