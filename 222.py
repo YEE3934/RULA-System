@@ -1,3 +1,4 @@
+import streamlit as st
 import cv2
 import mediapipe as mp
 import math
@@ -6,8 +7,7 @@ import pandas as pd
 import os
 import zipfile
 import io
-import tkinter as tk
-from tkinter import filedialog, ttk, messagebox
+import tempfile
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
@@ -76,7 +76,7 @@ def put_chinese_text(img, text, position, color, size=15):
     draw.text(position, text, fill=(color[2], color[1], color[0]), font=font)
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-# ==================== 【單張影像完整 AI 分析模組 (含人因零度校正 & 幾何防禦)】 ====================
+# ==================== 【單張影像完整 AI 分析模組】 ====================
 def analyze_image(frame, pose_model, m_val, f_val):
     orig_h, orig_w = frame.shape[:2]
     scale = min(800 / orig_w, 600 / orig_h)
@@ -94,47 +94,38 @@ def analyze_image(frame, pose_model, m_val, f_val):
     n_lm = results.pose_landmarks.landmark
     
     try:
-        # 計算原始各部位信賴度
         conf_neck = round((n_lm[7].visibility + n_lm[8].visibility + n_lm[11].visibility + n_lm[12].visibility) / 4 * 100, 1)
         conf_r_arm = round((n_lm[24].visibility + n_lm[12].visibility + n_lm[14].visibility + n_lm[16].visibility) / 4 * 100, 1)
         conf_l_arm = round((n_lm[23].visibility + n_lm[11].visibility + n_lm[13].visibility + n_lm[15].visibility) / 4 * 100, 1)
         overall_conf = (conf_neck + conf_r_arm + conf_l_arm) / 3 
 
-        # 幾何合理性審查 (防禦正面彎腰透視變形)
         shoulder_width_2d = abs(n_lm[11].x - n_lm[12].x)
         trunk_length_2d = math.hypot(((n_lm[11].x + n_lm[12].x) / 2) - ((n_lm[23].x + n_lm[24].x) / 2),
                                      ((n_lm[11].y + n_lm[12].y) / 2) - ((n_lm[23].y + n_lm[24].y) / 2))
         if trunk_length_2d > 0 and shoulder_width_2d > trunk_length_2d * 0.8: 
             overall_conf = overall_conf * 0.5 
 
-        # 抓取 3D 座標點
         ls, rs = [w_lm[11].x, w_lm[11].y, w_lm[11].z], [w_lm[12].x, w_lm[12].y, w_lm[12].z]
         le, re = [w_lm[13].x, w_lm[13].y, w_lm[13].z], [w_lm[14].x, w_lm[14].y, w_lm[14].z]
         lw, rw = [w_lm[15].x, w_lm[15].y, w_lm[15].z], [w_lm[16].x, w_lm[16].y, w_lm[16].z]
         lh, rh = [w_lm[23].x, w_lm[23].y, w_lm[23].z], [w_lm[24].x, w_lm[24].y, w_lm[24].z]
         le_ear, ri_ear = [w_lm[7].x, w_lm[7].y, w_lm[7].z], [w_lm[8].x, w_lm[8].y, w_lm[8].z]
 
-        # =================【RULA 人因工程標準絕對角度校正】=================
-        # 1. 下臂彎曲 (Elbow): 180 - 數學內角 (完全打直=0度)
         ang_r_elb = abs(180 - calculate_3d_angle(rs, re, rw))
         ang_l_elb = abs(180 - calculate_3d_angle(ls, le, lw))
 
-        # 2. 上臂屈曲 (Upper Arm): 相對於絕對垂直線 (Y軸向下 +1.0)
         r_sh_down = [rs[0], rs[1] + 1.0, rs[2]]
         l_sh_down = [ls[0], ls[1] + 1.0, ls[2]]
         ang_r_sh = calculate_3d_angle(r_sh_down, rs, re)
         ang_l_sh = calculate_3d_angle(l_sh_down, ls, le)
 
-        # 3. 軀幹彎曲 (Trunk): 相對於骨盆絕對垂直線 (Y軸向上 -1.0)
         mid_sh = [(ls[0]+rs[0])/2, (ls[1]+rs[1])/2, (ls[2]+rs[2])/2]
         mid_hip = [(lh[0]+rh[0])/2, (lh[1]+rh[1])/2, (lh[2]+rh[2])/2]
         hip_up = [mid_hip[0], mid_hip[1] - 1.0, mid_hip[2]] 
         ang_trunk = calculate_3d_angle(hip_up, mid_hip, mid_sh)
 
-        # 4. 頸部彎曲 (Neck): 相對於軀幹軸線
         mid_ear = [(le_ear[0]+ri_ear[0])/2, (le_ear[1]+ri_ear[1])/2, (le_ear[2]+ri_ear[2])/2]
         ang_neck = abs(180 - calculate_3d_angle(mid_hip, mid_sh, mid_ear))
-        # ===============================================================
 
         s_nk, s_tk = get_neck_score(ang_neck), get_trunk_score(ang_trunk)
         r_ua, r_la = get_upper_arm_score(ang_r_sh), get_lower_arm_score(ang_r_elb)
@@ -164,163 +155,129 @@ def analyze_image(frame, pose_model, m_val, f_val):
     except Exception as e:
         return False, None, image, 0.0  
 
-# ==================== 【Tkinter 彈出式設定視窗】 ====================
-class MultiCamSettingsApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("RULA 系統")
-        self.root.geometry("500x450")
-        
-        self.vid1, self.vid2 = "", ""
-        self.num_samples = tk.IntVar(value=50)
-        self.is_start = False
-        
-        tk.Label(root, text="第一步：選擇拍攝視角影片", font=("微軟正黑體", 12, "bold")).pack(pady=(10,5))
-        
-        frame_cams = tk.Frame(root)
-        frame_cams.pack()
-        
-        self.btn_v1 = tk.Button(frame_cams, text=" 選擇 [正面鏡頭] 影片", command=lambda: self.select_file(1), font=("微軟正黑體", 10))
-        self.btn_v1.grid(row=0, column=0, padx=10, pady=5)
-        self.lbl_v1 = tk.Label(frame_cams, text="未選擇", fg="blue", width=20, anchor="w")
-        self.lbl_v1.grid(row=0, column=1)
-        
-        self.btn_v2 = tk.Button(frame_cams, text=" 選擇 [側面鏡頭] 影片", command=lambda: self.select_file(2), font=("微軟正黑體", 10))
-        self.btn_v2.grid(row=1, column=0, padx=10, pady=5)
-        self.lbl_v2 = tk.Label(frame_cams, text="未選擇 (可選)", fg="gray", width=20, anchor="w")
-        self.lbl_v2.grid(row=1, column=1)
-        
-        tk.Label(root, text="第二步：等距抽樣與參數設定", font=("微軟正黑體", 12, "bold")).pack(pady=(15,5))
-        
-        frame_params = tk.Frame(root)
-        frame_params.pack()
-        tk.Label(frame_params, text="抽樣照片張數:").grid(row=0, column=0, sticky="e", pady=5)
-        tk.Spinbox(frame_params, from_=5, to=200, textvariable=self.num_samples, width=10).grid(row=0, column=1, pady=5)
-        
-        tk.Label(frame_params, text="肌肉狀態 (Muscle):").grid(row=1, column=0, sticky="e", pady=5)
-        self.combo_muscle = ttk.Combobox(frame_params, values=["0: 無維持超過1分鐘", "1: 姿勢維持>1分鐘/高頻率"], state="readonly", width=25)
-        self.combo_muscle.current(0)
-        self.combo_muscle.grid(row=1, column=1, pady=5)
-        
-        tk.Label(frame_params, text="荷重施力 (Force):").grid(row=2, column=0, sticky="e", pady=5)
-        self.combo_force = ttk.Combobox(frame_params, values=["0: < 2kg (間歇)", "1: 2-10kg (間歇)", "2: 2-10kg (靜態/重複)", "2: 負載 > 10kg (間歇性)", "3: > 10kg"], state="readonly", width=25)
-        self.combo_force.current(0)
-        self.combo_force.grid(row=2, column=1, pady=5)
-        
-        self.btn_start = tk.Button(root, text="啟動分析", command=self.start_analysis, font=("微軟正黑體", 12, "bold"), bg="#4CAF50", fg="white", height=2)
-        self.btn_start.pack(pady=20, fill="x", padx=20)
-        
-    def select_file(self, cam_id):
-        path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.mov *.avi")])
-        if path:
-            if cam_id == 1:
-                self.vid1 = path
-                self.lbl_v1.config(text=os.path.basename(path), fg="blue")
-            else:
-                self.vid2 = path
-                self.lbl_v2.config(text=os.path.basename(path), fg="blue")
+
+# ==================== 【Streamlit 網頁版 UI】 ====================
+st.set_page_config(page_title="RULA 系統", layout="wide")
+st.title("RULA AI 姿勢危害分析系統")
+
+st.header("第一步：選擇拍攝視角影片")
+col1, col2 = st.columns(2)
+with col1:
+    vid1_file = st.file_uploader("選擇 [正面鏡頭] 影片", type=['mp4', 'mov', 'avi'])
+with col2:
+    vid2_file = st.file_uploader("選擇 [側面鏡頭] 影片 (可選)", type=['mp4', 'mov', 'avi'])
+
+st.header("第二步：等距抽樣與參數設定")
+num_samples = st.slider("抽樣照片張數", min_value=5, max_value=200, value=50)
+
+col3, col4 = st.columns(2)
+with col3:
+    combo_muscle = st.selectbox("肌肉狀態 (Muscle):", ["0: 無維持超過1分鐘", "1: 姿勢維持>1分鐘/高頻率"])
+with col4:
+    combo_force = st.selectbox("荷重施力 (Force):", ["0: < 2kg (間歇)", "1: 2-10kg (間歇)", "2: 2-10kg (靜態/重複)", "2: 負載 > 10kg (間歇性)", "3: > 10kg"])
+
+if st.button("🚀 啟動分析", type="primary", use_container_width=True):
+    if not vid1_file:
+        st.warning("請至少上傳第一支（正面鏡頭）影片！")
+    else:
+        # ==================== 【主程式：等距截圖與 Sensor Fusion】 ====================
+        with st.spinner("影片處理與分析中，請稍候..."):
+            # 將上傳的影片存入虛擬暫存檔，讓 cv2 可以讀取
+            tfile1 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+            tfile1.write(vid1_file.read())
+            vid1_path = tfile1.name
             
-    def start_analysis(self):
-        if not self.vid1:
-            messagebox.showwarning("請至少選擇第一支影片！")
-            return
-        self.m_val = int(self.combo_muscle.get().split(":")[0])
-        self.f_val = int(self.combo_force.get().split(":")[0])
-        self.is_start = True
-        self.root.destroy()
+            vid2_path = None
+            if vid2_file:
+                tfile2 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                tfile2.write(vid2_file.read())
+                vid2_path = tfile2.name
 
-root = tk.Tk()
-app = MultiCamSettingsApp(root)
-root.mainloop()
+            m_val = int(combo_muscle.split(":")[0])
+            f_val = int(combo_force.split(":")[0])
 
-if not app.is_start:
-    print("使用者取消操作，程式結束。")
-    exit()
+            cap1 = cv2.VideoCapture(vid1_path)
+            fps = cap1.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
 
-# ==================== 【主程式：等距截圖與 Sensor Fusion】 ====================
-print(f"\n 準備進行分析...")
-cap1 = cv2.VideoCapture(app.vid1)
-fps = cap1.get(cv2.CAP_PROP_FPS)
-total_frames = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
+            use_dual_cam = bool(vid2_path)
+            if use_dual_cam:
+                cap2 = cv2.VideoCapture(vid2_path)
+                total_frames = min(total_frames, int(cap2.get(cv2.CAP_PROP_FRAME_COUNT)))
 
-use_dual_cam = bool(app.vid2)
-if use_dual_cam:
-    cap2 = cv2.VideoCapture(app.vid2)
-    total_frames = min(total_frames, int(cap2.get(cv2.CAP_PROP_FRAME_COUNT)))
+            sample_indices = np.linspace(0, total_frames - 1, num_samples, dtype=int).tolist()
 
-# 使用 numpy linspace 確保時間完美等分，包含首尾
-target_samples = app.num_samples.get()
-sample_indices = np.linspace(0, total_frames - 1, target_samples, dtype=int).tolist()
-
-print(f"\n 正在擷取抽樣照片")
-raw_frames_1, raw_frames_2 = [], []
-for idx in sample_indices:
-    current_time_sec = round(idx / fps, 2)
-    cap1.set(cv2.CAP_PROP_POS_FRAMES, idx)
-    succ1, f1 = cap1.read()
-    if succ1: raw_frames_1.append((current_time_sec, f1))
-    
-    if use_dual_cam:
-        cap2.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        succ2, f2 = cap2.read()
-        if succ2: raw_frames_2.append((current_time_sec, f2))
-
-cap1.release()
-if use_dual_cam: cap2.release()
-print(f"照片擷取完成\n")
-
-print(f"進行多視角信賴度分析")
-records = []
-zip_images = []
-
-with mp.solutions.pose.Pose(static_image_mode=True, min_detection_confidence=0.7) as pose:
-    for i in range(len(raw_frames_1)):
-        sec, frame1 = raw_frames_1[i]
-        
-        succ_1, data_1, img_1, conf_1 = analyze_image(frame1, pose, app.m_val, app.f_val)
-        best_data, best_img, best_cam_label, best_conf = data_1, img_1, "正面/鏡頭 A", conf_1
-        
-        if use_dual_cam and i < len(raw_frames_2):
-            _, frame2 = raw_frames_2[i]
-            succ_2, data_2, img_2, conf_2 = analyze_image(frame2, pose, app.m_val, app.f_val)
-            
-            # 若正面鏡頭發生透視壓縮，其 conf_1 會被打對折，讓側面 conf_2 勝出
-            if succ_2 and conf_2 > conf_1:
-                best_data, best_img, best_cam_label, best_conf = data_2, img_2, "側面/鏡頭 B", conf_2
-        
-        if best_data is not None:
-            final_record = {"樣本編號": i + 1, "時間(秒)": sec, "最佳視角來源": best_cam_label, "最佳綜合信賴度(%)": round(best_conf, 1)}
-            final_record.update(best_data)
-            final_record.pop('Overall_Conf', None)
-            records.append(final_record)
-            
-            # 畫上採用結果
-            best_img = put_chinese_text(best_img, f"時間: {sec}秒 | {best_data['最危害側']}高風險", (15, 15), (0, 255, 255), 18)
-            best_img = put_chinese_text(best_img, f"總分: {best_data['Grand Score']} 分 | {best_data['AL']}", (15, 45), (0, 0, 255) if best_data['Grand Score'] > 4 else (0,255,0), 16)
-            best_img = put_chinese_text(best_img, f"🏆 採用畫面: {best_cam_label} (信賴度: {best_conf:.1f}%)", (15, 75), (255, 150, 0), 14)
-            
-            is_success, buffer = cv2.imencode(".jpg", best_img)
-            if is_success:
-                zip_images.append((f"Sample_{i+1:03d}_{sec}s_BestCam.jpg", buffer.tobytes()))
+            raw_frames_1, raw_frames_2 = [], []
+            for idx in sample_indices:
+                current_time_sec = round(idx / fps, 2)
+                cap1.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                succ1, f1 = cap1.read()
+                if succ1: raw_frames_1.append((current_time_sec, f1))
                 
-        print(f"進度: {i+1}/{len(raw_frames_1)} 筆比對完成...", end="\r")
+                if use_dual_cam:
+                    cap2.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    succ2, f2 = cap2.read()
+                    if succ2: raw_frames_2.append((current_time_sec, f2))
 
-print(f"\n✅ 分析完成！\n")
+            cap1.release()
+            if use_dual_cam: cap2.release()
 
-# ==================== 【主程式：階段 3 (建立 ZIP 壓縮檔匯出)】 ====================
-print(f"打包照片庫與數據報表成 ZIP")
+            records = []
+            zip_images = []
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-zip_filename = f"MultiCam_RULA_Report_{current_time}.zip"
+            with mp.solutions.pose.Pose(static_image_mode=True, min_detection_confidence=0.7) as pose:
+                total_samples = len(raw_frames_1)
+                for i in range(total_samples):
+                    sec, frame1 = raw_frames_1[i]
+                    
+                    succ_1, data_1, img_1, conf_1 = analyze_image(frame1, pose, m_val, f_val)
+                    best_data, best_img, best_cam_label, best_conf = data_1, img_1, "正面/鏡頭 A", conf_1
+                    
+                    if use_dual_cam and i < len(raw_frames_2):
+                        _, frame2 = raw_frames_2[i]
+                        succ_2, data_2, img_2, conf_2 = analyze_image(frame2, pose, m_val, f_val)
+                        
+                        if succ_2 and conf_2 > conf_1:
+                            best_data, best_img, best_cam_label, best_conf = data_2, img_2, "側面/鏡頭 B", conf_2
+                    
+                    if best_data is not None:
+                        final_record = {"樣本編號": i + 1, "時間(秒)": sec, "最佳視角來源": best_cam_label, "最佳綜合信賴度(%)": round(best_conf, 1)}
+                        final_record.update(best_data)
+                        final_record.pop('Overall_Conf', None)
+                        records.append(final_record)
+                        
+                        best_img = put_chinese_text(best_img, f"時間: {sec}秒 | {best_data['最危害側']}高風險", (15, 15), (0, 255, 255), 18)
+                        best_img = put_chinese_text(best_img, f"總分: {best_data['Grand Score']} 分 | {best_data['AL']}", (15, 45), (0, 0, 255) if best_data['Grand Score'] > 4 else (0,255,0), 16)
+                        best_img = put_chinese_text(best_img, f"🏆 採用畫面: {best_cam_label} (信賴度: {best_conf:.1f}%)", (15, 75), (255, 150, 0), 14)
+                        
+                        is_success, buffer = cv2.imencode(".jpg", best_img)
+                        if is_success:
+                            zip_images.append((f"Sample_{i+1:03d}_{sec}s_BestCam.jpg", buffer.tobytes()))
+                    
+                    # 更新網頁進度條
+                    progress_bar.progress((i + 1) / total_samples)
+                    status_text.text(f"影像辨識進度: {i+1} / {total_samples} 筆完成")
 
-with zipfile.ZipFile(zip_filename, 'w') as zf:
-    if records:
-        df = pd.DataFrame(records)
-        csv_bytes = df.to_csv(index=False).encode('utf-8-sig')
-        zf.writestr("RULA統計報表.csv", csv_bytes)
-    
-    for filename, img_bytes in zip_images:
-        zf.writestr(f"照片庫/{filename}", img_bytes)
-
-print(f" 成果已成功產生")
-print(f" 在左側檔案總管查看並解壓縮這個檔案：【 {zip_filename} 】\n")
+            # ==================== 【主程式：打包 ZIP 提供下載】 ====================
+            # 建立記憶體緩衝區來存放 ZIP，避免在雲端無權限寫入硬碟的問題
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w') as zf:
+                if records:
+                    df = pd.DataFrame(records)
+                    csv_bytes = df.to_csv(index=False).encode('utf-8-sig')
+                    zf.writestr("RULA統計報表.csv", csv_bytes)
+                
+                for filename, img_bytes in zip_images:
+                    zf.writestr(f"照片庫/{filename}", img_bytes)
+            
+            st.success("✅ 分析完成！請點擊下方按鈕下載完整數據與照片。")
+            
+            # 顯示下載按鈕
+            st.download_button(
+                label="📦 下載 RULA 稽核報表 (ZIP)",
+                data=zip_buffer.getvalue(),
+                file_name=f"MultiCam_RULA_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zi
