@@ -2879,7 +2879,7 @@ if page == 4:
     st.subheader('啟動分析')
     ready_files=[name for name,f in [('正面',vid_front_file),('右側',vid_right_file),('左側',vid_left_file)] if f]
     st.write('已上傳：'+('、'.join(ready_files) if ready_files else '尚未上傳影片'))
-    st.write(f'抽樣數：{num_samples}　｜　分析模式：{eval_mode})
+    st.write(f'抽樣數：{num_samples}　｜　分析模式：{eval_mode}')
     if leg_support_choice==LEG_OPTIONS[0] or any((right_wrist_twist_choice if side=='右手側' else left_wrist_twist_choice)==TWIST_OPTIONS[0]
          for side in (('右手側','左手側') if eval_mode.startswith('左右側') else (eval_mode,))):
         st.warning('請先返回「人工條件」填妥腿足支撐、所選側別的手腕扭轉，才能開始分析。')
