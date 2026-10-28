@@ -52,7 +52,7 @@ class TestOcclusion(unittest.TestCase):
         qc={'品質狀態':'留意','品質原因':'重疊線索',
             '品質嫌疑關節':'wr','頭頸手臂重疊風險':True}
         namespace['v11_1_neck_crosscheck'](qc,{'頸部角度':39.0},{'頸部角度':8.0})
-        self.assertEqual(qc['品質狀態'],'需人工複核')
+        self.assertEqual(qc['品質狀態'],'留意')  # 頸部分歧交給行動等級敏感度判斷，不直接整筆拒絕
 
     def test_big_angle_gap_same_grade_only_diagnosis(self):
         qc={'品質狀態':'通過','品質原因':'通過',
@@ -64,6 +64,6 @@ class TestOcclusion(unittest.TestCase):
     def test_does_not_change_rula_formula(self):
         text=FILE.read_text(encoding='utf-8')
         self.assertIn('Hand 2D（優先）',text)
-        self.assertIn('RULA_FINAL_SAME_SIDE_NECK_CLEAN_REPORT_',text)
+        self.assertIn('RULA_SHARED_NECK_LOCAL_REVIEW_FINAL_',text)
 
 if __name__=='__main__':unittest.main(verbosity=2)

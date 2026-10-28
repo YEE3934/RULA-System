@@ -53,7 +53,7 @@ from PIL import Image, ImageDraw, ImageFont
 # Complexity 2 asks MediaPipe to download pose_landmark_heavy.tflite into site-packages,
 # which is typically read-only on hosted deployments.
 POSE_MODEL_COMPLEXITY = 1
-APP_BUILD_TAG = "RULA_FINAL_SAME_SIDE_NECK_CLEAN_REPORT_2026-10-29"
+APP_BUILD_TAG = "RULA_SHARED_NECK_LOCAL_REVIEW_FINAL_2026-10-29"
 
 # ==================== 【沿用 v6 RULA 查表矩陣：仍需標準工作表逐格核對】 ====================
 TABLE_A = {
@@ -344,8 +344,8 @@ def v11_1_neck_crosscheck(qc, data, peer):
         qc['頸部跨鏡頭診斷']='缺少同步另一側有效資料'
         return
     try:
-        a=float(data.get('頸部角度',np.nan))
-        b=float(peer.get('頸部角度',np.nan))
+        a=float(data.get('頸部獨立估測角度',data.get('頸部角度',np.nan)))
+        b=float(peer.get('頸部獨立估測角度',peer.get('頸部角度',np.nan)))
     except (TypeError,ValueError):return
     if not (np.isfinite(a) and np.isfinite(b)):return
     def neck_base(angle):return 1 if angle<=10 else 2 if angle<=20 else 3
@@ -359,9 +359,8 @@ def v11_1_neck_crosscheck(qc, data, peer):
         parts.add('neck')
         qc['品質嫌疑關節']=','.join(sorted(parts))
         if qc['品質狀態']=='通過':qc['品質狀態']='留意'
-        if qc.get('頭頸手臂重疊風險') and angle_gap>=20:
-            qc['品質狀態']='需人工複核'
-            qc['品質原因']+='；與頭頸／手臂重疊線索同時存在'
+        # 跨鏡頭頸部分級分歧由 shared_neck_decide_pair 依行動等級影響處理；
+        # 不能僅因角度差大＋手臂靠近頭部，就要求重評整張影格。
     elif angle_gap >= 15:
         qc['頸部跨鏡頭診斷']='兩視角角度差大，但頸部基礎分級一致；僅保留診斷'
     else:
@@ -1087,6 +1086,86 @@ def compute_rula_full(ua, la, w, wt, nk, tk, lg, m_val, f_val):
     grand_score = TABLE_C[min(score_c, 8) - 1][min(score_d, 7) - 1]
     al_num = 1 if grand_score <= 2 else (2 if grand_score <= 4 else (3 if grand_score <= 6 else 4))
     return score_a, score_b, score_c, score_d, grand_score, f"AL{al_num}"
+
+
+# ===== 結案版：同一時間點共用頸部分數，只有可能改變行動等級才局部複核 =====
+# 注意：左右影像 2D 頸角不等於經校準的頸椎角度；本邏輯不選「信心值高的那邊」。
+def shared_neck_rula_with_score(data, side, neck_score, manual_override=None):
+    """固定其他部位，只把頸部分數改成同一個共用值後重新執行 RULA 查表。"""
+    prefix = '右手' if side == '右手側' else '左手'
+    manual_override = manual_override or {}
+    def val(label, key):
+        raw=manual_override.get('人工'+label+'分數',data[key])
+        return int(raw)
+    return compute_rula_full(
+        val('上臂',prefix+'上臂分數'), val('前臂',prefix+'前臂分數'),
+        val('手腕',prefix+'手腕分數'), val('腕扭轉',prefix+'手腕扭轉分數'),
+        int(neck_score), val('軀幹','軀幹分數'), val('腿部','腿部分數'),
+        val('肌肉','肌肉使用加分'), val('負重','負重施力加分')
+    )
+
+
+def shared_neck_apply_to_side(data, side, neck_score, status, source):
+    """覆寫正式頸部分數及所有依賴它的 RULA 表格與總分；保留原始角度於技術欄位。"""
+    prefix='右手' if side=='右手側' else '左手'
+    data.setdefault('頸部獨立估測分數',int(data['頸部分數']))
+    data.setdefault('頸部獨立估測角度',data.get('頸部角度'))
+    result=shared_neck_rula_with_score(data,side,neck_score)
+    a,b,c,d,total,al=result
+    data.update({'頸部分數':int(neck_score),'頸部共用分數':int(neck_score),
+        '頸部共用狀態':status,'頸部共用來源':source,
+        prefix+' Score A':a,'頸軀腿 Score B':b,prefix+' Score C':c,
+        '頸軀腿 Score D':d,prefix+' Grand Score':total,
+        prefix+' AL':al,'最終最高分':total,'最終 AL':al})
+    return result
+
+
+def shared_neck_decide_pair(right, left, sample_id, second):
+    """不從較高 visibility 猜真值。若兩種頸分可導致不同完整雙側 AL，改人工局部確認。"""
+    if right is None or left is None:
+        return None
+    nr=int(right['頸部分數']); nl=int(left['頸部分數'])
+    options=sorted({nr,nl})
+    scenario={}
+    for n in options:
+        r=shared_neck_rula_with_score(right,'右手側',n)
+        l=shared_neck_rula_with_score(left,'左手側',n)
+        worst=max(r[4],l[4]);al='AL'+str(1 if worst<=2 else 2 if worst<=4 else 3 if worst<=6 else 4)
+        scenario[n]={'右手分數':r[4],'左手分數':l[4],'雙側最高分':worst,'雙側AL':al}
+    impactful=len({v['雙側AL'] for v in scenario.values()})>1
+    chosen=max(options)  # 若 AL 不變，仍保守採用較高的同一個頸部分數；不是角度真值
+    if nr==nl:
+        state='一致，自動採用';source='左右頸部分數一致'
+    elif impactful:
+        state='待頸部人工確認';source='左右不同且可能改變雙側行動等級'
+    else:
+        state='自動保守共用';source='左右不同，但完整雙側行動等級不變'
+    result={'樣本編號':int(sample_id),'時間(秒)':float(second),
+        '右側原頸部分數':nr,'左側原頸部分數':nl,
+        '右側原頸角':right.get('頸部角度'), '左側原頸角':left.get('頸部角度'),
+        '選定共用頸部分數':chosen,'狀態':state,'需要人工確認':impactful,
+        '選擇說明':source,'各候選情境':scenario}
+    shared_neck_apply_to_side(right,'右手側',chosen,state,source)
+    shared_neck_apply_to_side(left,'左手側',chosen,state,source)
+    return result
+
+
+def shared_neck_reviewed_score(source_row, side, neck_score, manual=None):
+    """讓人工頸分真正反映在複核後雙側分數；未取代手動輸入的其他部位。"""
+    values=shared_neck_rula_with_score(source_row,side,neck_score,manual)
+    return int(values[4]),str(values[5])
+
+
+def shared_neck_case_table(cases, decisions):
+    rows=[]
+    for sid,case in sorted((cases or {}).items()):
+        chosen=(decisions or {}).get(int(sid))
+        rows.append({'樣本編號':sid,'系統狀態':case['狀態'],
+          '目前共用頸部分數':int(chosen) if chosen is not None else (
+              None if case['需要人工確認'] else int(case['選定共用頸部分數'])),
+          '是否仍需人工確認':bool(case['需要人工確認'] and chosen is None),
+          '說明':('已人工確認頸部分數' if chosen is not None else case['選擇說明'])})
+    return pd.DataFrame(rows)
 
 # ==================== 【全 33 點生物力學渲染器 (全身雙側完整繪製 + 目標側高亮標註)】 ====================
 def draw_full_biomechanical_skeleton(
@@ -2012,7 +2091,7 @@ def v113_record_status(sample, side, source_row, decisions, overrides, flagged_k
     return ('一般提醒：預設保留自動評分' if is_notice else '自動品質通過'), int(source_row['右手 Grand Score' if side=='右手側' else '左手 Grand Score']), str(source_row['右手 AL' if side=='右手側' else '左手 AL'])
 
 
-def v113_build_reviewed_data(side_frames, items, decisions, overrides, legacy=None, mode=None):
+def v113_build_reviewed_data(side_frames, items, decisions, overrides, legacy=None, mode=None, neck_cases=None, neck_decisions=None):
     """Produce reviewed side + combined reports without touching original automation data.
 
     If dual mode and only one side is valid, preserve it as partial-side evidence but
@@ -2033,11 +2112,26 @@ def v113_build_reviewed_data(side_frames, items, decisions, overrides, legacy=No
     allids.update(int(item['樣本編號']) for item in items if item.get('評估側') in sampled)
     allids.update(int(sid) for (side,sid) in overrides if side in sampled)
     allids.update(int(key.split('_',1)[0]) for key in decisions if key.split('_',1)[-1] in sampled)
+    allids.update(int(sid) for sid in (neck_cases or {}).keys())
     rows=[]
     for sid in sorted(allids):
+        neck_case=(neck_cases or {}).get(sid)
+        neck_choice=(neck_decisions or {}).get(sid)
         for side in sides:
             original=sampled[side].get(sid)
             status,grand,al=v113_record_status(sid,side,original,decisions,overrides,flagged_keys,notice_keys,legacy)
+            if original is not None and neck_case is not None:
+                if neck_case['需要人工確認'] and neck_choice is None and grand is not None:
+                    # 不讓使用者在別處「維持自動評分」繞過共同頸部分級的待確認狀態。
+                    status,grand,al='待頸部局部人工確認',None,None
+                elif neck_choice is not None and grand is not None:
+                    # 其他人工修改仍優先保留，僅統一替換頸部分數。
+                    manual=overrides.get((side,sid))
+                    try:
+                        grand,al=shared_neck_reviewed_score(original,side,int(neck_choice),manual)
+                        status='已確認共同頸部分數'+('／保留其他人工修改' if manual else '')
+                    except (KeyError,TypeError,ValueError):
+                        status,grand,al='頸部重新計分失敗，需人工檢查',None,None
             rows.append({
                 '樣本編號':sid,'評估側':side,
                 '原始Grand Score':(original.get('右手 Grand Score' if side=='右手側' else '左手 Grand Score') if original is not None else None),
@@ -2046,8 +2140,10 @@ def v113_build_reviewed_data(side_frames, items, decisions, overrides, legacy=No
                 '結果狀態':status,'使用者選擇':decisions.get(v113_key(sid,side),'未額外指定'),
                 '是否納入可信統計':grand is not None,
                 '原始品質狀態':(original.get('品質狀態','') if original is not None else '無有效自動評分'),
+                '採用頸部分數':(int(neck_choice) if neck_choice is not None else (neck_case['選定共用頸部分數'] if neck_case and not neck_case['需要人工確認'] else None)),
+                '頸部確認狀態':('待人工確認' if neck_case and neck_case['需要人工確認'] and neck_choice is None else ('人工已確認' if neck_choice is not None else ('系統自動共用' if neck_case else '單側評估'))),
             })
-    review_df=pd.DataFrame(rows, columns=['樣本編號','評估側','原始Grand Score','原始AL','複核後Grand Score','複核後AL','結果狀態','使用者選擇','是否納入可信統計','原始品質狀態'])
+    review_df=pd.DataFrame(rows, columns=['樣本編號','評估側','原始Grand Score','原始AL','複核後Grand Score','複核後AL','結果狀態','使用者選擇','是否納入可信統計','原始品質狀態','採用頸部分數','頸部確認狀態'])
     consolidated=[]
     for sid in sorted(allids):
         side_rows={r['評估側']:r for r in rows if r['樣本編號']==sid}
@@ -2064,13 +2160,16 @@ def v113_build_reviewed_data(side_frames, items, decisions, overrides, legacy=No
                 '左手複核後分數':side_rows['左手側']['複核後Grand Score'],
                 '完整雙側最高分':(higher[1]['複核後Grand Score'] if both_valid else None),
                 '完整雙側AL':(higher[1]['複核後AL'] if both_valid else None),
+                '採用頸部分數':side_rows['右手側'].get('採用頸部分數'),
+                '頸部確認狀態':side_rows['右手側'].get('頸部確認狀態'),
                 '最高風險側':(('雙側同分' if side_rows['右手側']['複核後Grand Score']==side_rows['左手側']['複核後Grand Score'] else higher[0]) if both_valid else '不可判定'),
                 '部分可用側別':('、'.join(side for side,_ in valid) if not both_valid else '')})
         else:
             side=sides[0]
             r=side_rows[side]
             consolidated.append({'樣本編號':sid,'雙側結果狀態':'單側分析','評估側':side,
-                '結果狀態':r['結果狀態'],'複核後Grand Score':r['複核後Grand Score'],'複核後AL':r['複核後AL']})
+                '結果狀態':r['結果狀態'],'複核後Grand Score':r['複核後Grand Score'],'複核後AL':r['複核後AL'],
+                '採用頸部分數':r.get('採用頸部分數'),'頸部確認狀態':r.get('頸部確認狀態')})
     return review_df,pd.DataFrame(consolidated)
 
 
@@ -2081,7 +2180,8 @@ def v113_current_reports():
                  else {mode:st.session_state.get('df_records')})
     return v113_build_reviewed_data(side_frames,st.session_state.get('v8_rejected_rows',[]),
             st.session_state.get('v113_review_decisions',{}),st.session_state.get('v4_overrides',{}),
-            st.session_state.get('v8_manual_rejected',{}),mode)
+            st.session_state.get('v8_manual_rejected',{}),mode,
+            st.session_state.get('shared_neck_cases',{}),st.session_state.get('shared_neck_decisions',{}))
 
 
 def v113_make_manual_score(sample, side, values, original=None, time_s=None):
@@ -2133,9 +2233,9 @@ def v113_manual_form(sample,side,item,source_row):
             st.rerun()
 
 
-def v113_finalize_report_zip(original_zip, side_frames, review_items, decisions, overrides, legacy=None):
+def v113_finalize_report_zip(original_zip, side_frames, review_items, decisions, overrides, legacy=None, neck_cases=None, neck_decisions=None):
     """Readable ZIP: clean user CSVs plus optional diagnostic material, original photos untouched."""
-    reviewed,combined=v113_build_reviewed_data(side_frames,review_items,decisions,overrides,legacy)
+    reviewed,combined=v113_build_reviewed_data(side_frames,review_items,decisions,overrides,legacy,neck_cases=neck_cases,neck_decisions=neck_decisions)
     out=io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(original_zip),'r') as source, zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as target:
         included=set()
@@ -2206,6 +2306,16 @@ def v113_finalize_report_zip(original_zip, side_frames, review_items, decisions,
                 target.writestr(name,content)
                 included.add(name)
         write_unique('複核後結果/逐側結果.csv',user_report_reviewed(reviewed).to_csv(index=False).encode('utf-8-sig'))
+        if neck_cases:
+            write_unique('複核後結果/頸部分級確認.csv',shared_neck_case_table(neck_cases,neck_decisions).to_csv(index=False).encode('utf-8-sig'))
+            details=[]
+            for sid,case in sorted(neck_cases.items()):
+                for score,scenario in case['各候選情境'].items():
+                    details.append({'樣本編號':sid,'右側原估分':case['右側原頸部分數'],
+                     '左側原估分':case['左側原頸部分數'],
+                     '右側原角(°)':case.get('右側原頸角'),'左側原角(°)':case.get('左側原頸角'),
+                     '候選共用頸分':score,**scenario,'狀態':case['狀態']})
+            write_unique('技術診斷/頸部分級情境比對.csv',pd.DataFrame(details).to_csv(index=False).encode('utf-8-sig'))
         write_unique('複核後結果/雙側結果.csv',user_report_reviewed(combined,combined=True).to_csv(index=False).encode('utf-8-sig'))
         history=[{'樣本編號':x.get('樣本編號'), '評估側':x.get('評估側'),
                   '紀錄類型':x.get('紀錄類型','辨識失敗'), '原因':x.get('拒絕原因',''),
@@ -2221,8 +2331,9 @@ def v113_finalize_report_zip(original_zip, side_frames, review_items, decisions,
             '照片：各樣本的原始影像和骨架圖。\n'
             '技術診斷/：僅供開發者追查關鍵點、品質判斷、算法來源；不屬一般正式報表。\n\n'
             '手腕：Hand 2D 優先，未達品質要求時 Pose 2D 備援；3D 不參與計分。\n'
-            '頸部：優先採用同側耳、肩、髖 2D 投影角；品質不符時使用原有基準。\n'
+            '頸部：左右同步且皆有效時採同一個頸部分數；分級衝突可能改變行動等級時僅需人工確認頸部。\n'
             '所有角度是影像幾何估測值，不是經校準的解剖關節角度。\n'
+            '左右頸部分級衝突且可能改變行動等級時，原始報表的候選總分會留空；完成局部頸部確認後，請以「複核後結果」為準。\n'
             '只要有一側無有效評分，就不輸出完整雙側最高分。\n'
             'RULA 標準查表及角度真值尚需獨立驗證。\n'
         ).encode('utf-8'))
@@ -2231,6 +2342,9 @@ def v113_finalize_report_zip(original_zip, side_frames, review_items, decisions,
 
 def v8_show_rejected_center():
     st.subheader('剔除樣本／骨架品質提醒：逐張查看與處置')
+    if any(x.get('需要人工確認') and sid not in st.session_state.get('shared_neck_decisions',{}) for sid,x in st.session_state.get('shared_neck_cases',{}).items()):
+        with st.expander('需要頸部分級確認的影格（只修改頸部）',expanded=True):
+            shared_neck_review_panel('reject')
     st.caption('每筆都可點開原始照片與骨架照片；一般品質提醒預設保留自動分數，只有使用者認為不可靠時才改成人工評分或剔除。原始分析檔不會被覆蓋。')
     all_items=st.session_state.get('v8_rejected_rows',[])
     actionable,notices=v112_split_review_items(all_items)
@@ -2311,27 +2425,71 @@ def v8_show_rejected_center():
     st.caption('所有決定將寫入下載 ZIP 的 Final_Reviewed/ 資料夾；可隨時回到本頁更改。')
 
 
+def shared_neck_review_panel(context='angle'):
+    """修改單一時點的共用頸部分數，左右 RULA 複核後結果會立即重算。"""
+    cases=st.session_state.get('shared_neck_cases',{})
+    decisions=st.session_state.setdefault('shared_neck_decisions',{})
+    pending=[sid for sid,c in sorted(cases.items()) if c.get('需要人工確認') and sid not in decisions]
+    if not pending:
+        st.success('目前沒有必須人工確認的共同頸部分數。')
+    else:
+        st.warning(f'{len(pending)} 筆兩側頸部分級衝突，可能改變完整雙側行動等級；只需確認這些影格的頸部。')
+    optional=[sid for sid,c in sorted(cases.items()) if c.get('需要人工確認')]
+    if not optional:
+        return
+    sid=st.selectbox('選擇需要局部確認的樣本',optional,
+        format_func=lambda s:f"第 {s} 筆｜"+('已人工確認' if s in decisions else '待頸部確認'),
+        key='shared_neck_pick_'+context)
+    case=cases[sid]
+    st.caption(f"右側原估分 {case['右側原頸部分數']} ／ 左側原估分 {case['左側原頸部分數']}；系統不會任選其中一個視角當成真值。")
+    # 實際左右側相同時間的正式分析骨架照片；原圖另保留於 ZIP。
+    cols=st.columns(2)
+    for col,side,photos in zip(cols,('右手側','左手側'),
+        (st.session_state.get('display_right_b64',[]),st.session_state.get('display_left_b64',[]))):
+        with col:
+            st.markdown('**'+side+'骨架照片**')
+            found=next((payload for caption,payload in photos if ('#'+str(sid)+' ') in caption),None)
+            if found:
+                v10_show_image(found,encoded=True)
+            else:
+                st.caption('沒有此側的骨架照片，請查看下載 ZIP 中的原圖。')
+    old=decisions.get(sid)
+    with st.form('shared_neck_form_'+context+'_'+str(sid)):
+        base=st.radio('頸部姿勢（RULA 基礎分數）',[
+            '前屈 0～10°（1分）','前屈 10～20°（2分）','前屈超過 20°（3分）','後仰（4分）'],
+            index=max(0,min(3,int(old)-1)) if old is not None else 0,
+            key='shared_neck_base_'+context+'_'+str(sid))
+        twists=st.checkbox('頸部扭轉（+1）',value=bool(old is not None and int(old)>=5),key='shared_neck_twist_'+context+'_'+str(sid))
+        bend=st.checkbox('頸部側彎（+1）',value=bool(old is not None and int(old)>=6),key='shared_neck_bend_'+context+'_'+str(sid))
+        st.caption('先確認頸部基礎姿勢，再選擇扭轉／側彎補正。兩側上肢沿用原本的自動及人工評分，不需重填。')
+        submit=st.form_submit_button('確認此筆頸部分數並重新計算雙側',type='primary')
+    if submit:
+        confirmed=min(6,int(base.split('（')[1][0])+int(twists)+int(bend))
+        decisions[int(sid)]=confirmed
+        st.success(f'已採用共同頸部分數 {confirmed}；左右側 RULA 會在複核後報表同步更新。')
+        st.rerun()
+    if sid in decisions and st.button('撤回這筆頸部確認',key='shared_neck_undo_'+context+'_'+str(sid)):
+        del decisions[sid]
+        st.rerun()
+
+
 def v8_show_neck_center():
-    st.subheader('頸部角度')
-    st.caption('僅顯示本次實際用於評分的頸部角度。畫面上的 E－S－H 線段表示同側耳、肩、髖測量基準。')
+    st.subheader('共同頸部分數')
+    st.caption('左右同步時，同一時間點使用同一個頸部分數。當兩種分級可能改變最終行動等級，才局部人工確認；不以高可見度鏡頭直接猜真值。')
     df=st.session_state.get('df_records')
     if df is None or df.empty:
         st.info('尚無可用頸部評估資料。')
         return
     dual=st.session_state.get('analyzed_mode')=='左右側同步計算'
     if dual:
-        display=user_report_neck(df)
-        st.dataframe(display,use_container_width=True,hide_index=True)
-        if len(display)>1:
-            chart_cols=[c for c in ('右側頸部角度(°)','左側頸部角度(°)') if c in display.columns]
-            if chart_cols:
-                st.line_chart(display.set_index('樣本編號')[chart_cols],y_label='頸部角度（度）')
+        st.dataframe(shared_neck_case_table(st.session_state.get('shared_neck_cases',{}),
+                 st.session_state.get('shared_neck_decisions',{})),
+                 use_container_width=True,hide_index=True)
+        shared_neck_review_panel('angle')
     else:
-        display=user_report_neck(df,st.session_state.get('analyzed_mode'))
-        st.dataframe(display,use_container_width=True,hide_index=True)
-        if len(display)>1 and '頸部角度(°)' in display.columns:
-            st.line_chart(display.set_index('樣本編號')[['頸部角度(°)']],y_label='頸部角度（度）')
-    st.caption('以上為單視角姿態估測角度，不等於經儀器校準的頸椎解剖角；關鍵點被遮擋時請檢視照片。')
+        st.dataframe(user_report_neck(df,st.session_state.get('analyzed_mode')),
+                     use_container_width=True,hide_index=True)
+    st.caption('E－S－H 原始幾何角與左右差異只保存於技術診斷，不代表經校準的解剖頸角。')
 
 # ==================== 【V9：多攝影機時間同步，Pose/RULA 演算法不變】 ====================
 # 每台影片的錨點是「相同真實事件」出現在該影片的秒數。
@@ -2704,7 +2862,7 @@ def user_report_side(df, side, with_scores=False):
         ('樣本編號','樣本編號'),('分析經過時間(秒)','時間(秒)'),('時間(秒)','同步相對時間(秒)'),
         ('評估側','評估側'),(f'{prefix}上臂角度','上臂角度(°)'),
         (f'{prefix}前臂角度','前臂角度(°)'),(f'{prefix}手腕角度','手腕角度(°)'),
-        ('頸部角度','頸部角度(°)'),('軀幹角度','軀幹角度(°)'),
+        ('頸部分數','頸部分數'),('頸部共用狀態','頸部確認狀態'),('軀幹角度','軀幹角度(°)'),
         (f'{prefix} Grand Score','RULA總分'),(f'{prefix} AL','行動等級'),
         ('品質狀態','品質狀態')]
     score_map = [(f'{prefix}上臂分數','上臂分數'),(f'{prefix}前臂分數','前臂分數'),
@@ -2719,6 +2877,12 @@ def user_report_side(df, side, with_scores=False):
             out[dst]=df[src]
         elif src == '評估側':
             out[dst]=side
+    # 未確認的共用頸部分數不得把候選 Grand Score 當成正式結果。
+    if '頸部共用狀態' in df.columns:
+        pending=df['頸部共用狀態'].eq('待頸部人工確認')
+        for name in ('RULA總分','行動等級'):
+            if name in out: out.loc[pending,name]=None
+        if '頸部分數' in out:out.loc[pending,'頸部分數']=None
     # 不輸出其他模型估計角度、過去演算法名稱、測試用品質欄位。
     return out.reset_index(drop=True)
 
@@ -2731,7 +2895,7 @@ def user_report_dual(df, with_scores=False):
         ('右手腕角度','右手腕角度(°)'),
         ('左上臂角度','左上臂角度(°)'),('左前臂角度','左前臂角度(°)'),
         ('左手腕角度','左手腕角度(°)'),
-        ('右側頸部實際角度','右側頸部角度(°)'),('左側頸部實際角度','左側頸部角度(°)'),
+        ('頸部分數','共同頸部分數'),('頸部共用狀態','頸部確認狀態'),
         ('軀幹角度','軀幹角度(°)'),('右手 Grand Score','右手RULA總分'),
         ('左手 Grand Score','左手RULA總分'),('最終最高分','雙側最高分'),
         ('最終 AL','行動等級'),('最危害側','較高風險側'),('品質狀態','品質狀態')]
@@ -2743,6 +2907,10 @@ def user_report_dual(df, with_scores=False):
     for src,dst in name_map+(scores if with_scores else []):
         if src in df.columns:
             out[dst]=df[src]
+    if '頸部共用狀態' in df.columns:
+        pending=df['頸部共用狀態'].eq('待頸部人工確認')
+        for name in ('右手RULA總分','左手RULA總分','雙側最高分','行動等級','共同頸部分數'):
+            if name in out: out.loc[pending,name]=None
     return out.reset_index(drop=True)
 
 
@@ -2750,10 +2918,10 @@ def user_report_reviewed(df, combined=False):
     if df is None or df.empty:
         return pd.DataFrame()
     if combined:
-        cols=['樣本編號','雙側結果狀態','右手複核後分數','左手複核後分數',
+        cols=['樣本編號','雙側結果狀態','採用頸部分數','頸部確認狀態','右手複核後分數','左手複核後分數',
               '完整雙側最高分','完整雙側AL','最高風險側','部分可用側別']
     else:
-        cols=['樣本編號','評估側','原始Grand Score','複核後Grand Score',
+        cols=['樣本編號','評估側','採用頸部分數','頸部確認狀態','原始Grand Score','複核後Grand Score',
               '複核後AL','結果狀態','是否納入可信統計','使用者選擇']
     mapping={'原始Grand Score':'原始總分','複核後Grand Score':'複核後總分',
              '複核後AL':'複核後行動等級','完整雙側AL':'行動等級',
@@ -2766,9 +2934,9 @@ def user_report_neck(df, side=None):
     if side is not None:
         return df[[c for c in ('樣本編號','分析經過時間(秒)','頸部角度','頸部分數') if c in df.columns]].rename(
             columns={'分析經過時間(秒)':'時間(秒)','頸部角度':'頸部角度(°)'}).copy()
-    return df[[c for c in ('樣本編號','分析經過時間(秒)','右側頸部實際角度','左側頸部實際角度') if c in df.columns]].rename(
-        columns={'分析經過時間(秒)':'時間(秒)','右側頸部實際角度':'右側頸部角度(°)',
-                 '左側頸部實際角度':'左側頸部角度(°)'}).copy()
+    return df[[c for c in ('樣本編號','分析經過時間(秒)','頸部分數','頸部共用狀態') if c in df.columns]].rename(
+        columns={'分析經過時間(秒)':'時間(秒)','頸部分數':'頸部分數',
+                 '頸部共用狀態':'確認狀態'}).copy()
 
 
 def user_report_wrist(df, side):
@@ -2841,6 +3009,8 @@ st.session_state.setdefault('v8_rejected_rows',[])
 st.session_state.setdefault('v8_rejected_photos',{})
 st.session_state.setdefault('v8_manual_rejected',{})
 st.session_state.setdefault('v113_review_decisions',{})
+st.session_state.setdefault('shared_neck_cases',{})
+st.session_state.setdefault('shared_neck_decisions',{})
 st.session_state.setdefault('v9_confirmed',False)
 st.session_state.setdefault('v9_sync_mode','尚未同步')
 st.session_state.setdefault('v9_confirmed_signature',None)
@@ -3255,6 +3425,8 @@ if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="prima
         st.session_state.zip_bytes = None
         st.session_state.hand_review_images = {}
         st.session_state.v113_review_decisions = {}
+        st.session_state.shared_neck_cases = {}
+        st.session_state.shared_neck_decisions = {}
         st.session_state.v8_rejected_rows = []
         st.session_state.v8_rejected_photos = {}
         st.session_state.v8_manual_rejected = {}
@@ -3319,6 +3491,7 @@ if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="prima
                           for i,t in enumerate(sample_times)}
 
             combined_records = []
+            shared_neck_cases = {}
             right_only_records = []
             left_only_records = []
             zip_right_imgs = []
@@ -3384,6 +3557,12 @@ if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="prima
                             manual_mods=build_manual_mods("左手側"),
                             hand_task=hand_task, hand_scoring_policy=v6_hand_policy
                         )
+                        # 共用頸分必須先於 QC、RULA 總表與影格標註建立。
+                        if succ_r and succ_l and data_r is not None and data_l is not None:
+                            neck_case=shared_neck_decide_pair(data_r,data_l,i+1,sec)
+                            if neck_case is not None:
+                                shared_neck_cases[i+1]=neck_case
+
                         if not succ_r or data_r is None:
                             skipped_right += 1
                             skip_diagnostics.append({"樣本編號": i+1, "時間(秒)": sec, "評估側": "右手側", "可能原因": "正面關鍵點不足" if not front_ok_r else "側面關鍵點不足或角度無效"})
@@ -3478,7 +3657,9 @@ if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="prima
                             comb_row = {
                                 "樣本編號": i + 1,
                                 "時間(秒)": sec,
-                                "頸部角度": round((data_r["頸部角度"] + data_l["頸部角度"]) / 2.0, 1),
+                                "頸部角度": np.nan,  # 相反視角 2D 頸角不得算術平均成解剖角
+                                "頸部分數": data_r['頸部分數'],
+                                "頸部共用狀態": data_r.get('頸部共用狀態','未知'),
                                 "頸部_v7_舊版平均(僅展示)": round((data_r["頸部_v7_原角度"]+data_l["頸部_v7_原角度"])/2,1),
                                 "右側頸部實際角度": data_r["頸部角度"],
                                 "左側頸部實際角度": data_l["頸部角度"],
@@ -3575,6 +3756,9 @@ if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="prima
                     'common_start':sync_start,'common_end':sync_end,'cameras':active_cams,
                     'neck_mode':neck_v114_mode},
                     ensure_ascii=False,indent=2).encode('utf-8'))
+                if shared_neck_cases:
+                    zf.writestr('Diagnostics/Shared_Neck_Cases.json',
+                        json.dumps(clean_json(list(shared_neck_cases.values())),ensure_ascii=False,indent=2).encode('utf-8'))
                 if not df_comb.empty:
                     zf.writestr("評估結果/雙側總覽.csv", user_report_dual(df_comb).to_csv(index=False).encode('utf-8-sig'))
                     zf.writestr("評估結果/雙側評分明細.csv", user_report_dual(df_comb,True).to_csv(index=False).encode('utf-8-sig'))
@@ -3627,6 +3811,7 @@ if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="prima
             st.session_state.df_records = df_comb
             st.session_state.df_right_only = df_r
             st.session_state.df_left_only = df_l
+            st.session_state.shared_neck_cases = shared_neck_cases
             st.session_state.display_right_b64 = display_right_b64
             st.session_state.display_left_b64 = display_left_b64
             st.session_state.zip_bytes = zip_buffer.getvalue()
@@ -4099,6 +4284,10 @@ if st.session_state.v9_screen == 'results':
         df_show = st.session_state.df_records
         st.subheader('📊 RULA 分析結果')
         st.caption('點選下方分頁直接檢視資料，不必再按下一步；如需修改分析設定，可從側邊欄返回。')
+        pending_neck=[sid for sid,item in st.session_state.get('shared_neck_cases',{}).items()
+                      if item.get('需要人工確認') and sid not in st.session_state.get('shared_neck_decisions',{})]
+        if pending_neck:
+            st.warning(f'有 {len(pending_neck)} 筆頸部姿勢可能改變風險行動等級，尚未確認。請至「角度檢視 → 頸部」只確認頸部分數。未確認者不列入可信統計。')
         (tab_overview, tab_review, tab_rejected, tab_angles,
          tab_gallery, tab_reports, tab_download) = st.tabs([
             '📈 風險總覽', '🔎 異常／人工覆核', '🧩 剔除樣本',
@@ -4237,7 +4426,9 @@ if st.session_state.v9_screen == 'results':
                         st.session_state.get('v8_rejected_rows',[]),
                         st.session_state.get('v113_review_decisions',{}),
                         st.session_state.get('v4_overrides',{}),
-                        st.session_state.get('v8_manual_rejected',{}))
+                        st.session_state.get('v8_manual_rejected',{}),
+                        st.session_state.get('shared_neck_cases',{}),
+                        st.session_state.get('shared_neck_decisions',{}))
                     render_blob_download_button(finalized,st.session_state.zip_filename,
                                                 f'📥 下載 {mode_now} 原始＋複核後報表 ZIP')
                 st.caption('ZIP 內的「評估結果」是精簡資料；「複核後結果」保留人工決策。需要研究細節時才查看「技術診斷」資料夾。')
