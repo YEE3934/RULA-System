@@ -2465,8 +2465,8 @@ def rula_job_csv(metadata):
     return pd.DataFrame([metadata]).to_csv(index=False).encode('utf-8-sig')
 
 # ==================== 【Streamlit 網頁應用介面】 ====================
-st.set_page_config(page_title="RULA 三視角人因工程 AI 評估系統", layout="wide")
-st.title("RULA v11.2 智慧姿勢評估｜結案穩定版")
+st.set_page_config(page_title="RULA 人因工程影像辨識系統", layout="wide")
+st.title("RULA 人因工程影像辨識系統")
 st.caption(f"部署版本：{APP_BUILD_TAG}｜執行檔：{os.path.basename(__file__)}｜MediaPipe Pose complexity={POSE_MODEL_COMPLEXITY}")
 
 # 啟動自檢：顯示實際部署版本並在分析前確認時序檢查函式已可呼叫。
@@ -2474,10 +2474,9 @@ st.caption(f"部署版本：{APP_BUILD_TAG}｜執行檔：{os.path.basename(__fi
 if not callable(globals().get("add_hand_temporal_notes")):
     st.error("部署自檢失敗：add_hand_temporal_notes 未完成定義。請檢查 GitHub 上傳的 222.py 是否完整。")
     st.stop()
-st.caption("✅ RULA v11.3：一般品質提醒可看雙照片並自行採用／人工評分／剔除；僅強制複核真正未通過品質檢查的樣本；一般提醒保留在診斷 CSV。Hand 2D 優先、Pose 2D 備援。")
 
 st.markdown(
-    "> **系統說明**：本工具以 MediaPipe Pose 關鍵點估算部分姿勢角度，遇到關鍵點可見度不足時會嘗試原圖、對比增強及放大圖；仍不可靠的樣本會略過。RULA 部分影像補正可選擇自動判讀；手腕扭轉、腿足支撐、聳肩、上臂支撐及扭轉等項目仍需人工確認，輸出仍須由受訓評估者複核，不應單獨作為醫療或職安決策依據。"
+    "> **系統說明**：本工具以 MediaPipe Pose 關鍵點估算部分姿勢角度，遇到關鍵點可見度不足時會嘗試原圖、對比增強及放大圖；仍不可靠的樣本會略過。RULA 部分影像補正可選擇自動判讀；手腕扭轉、腿足支撐、聳肩、上臂支撐及扭轉等項目仍需人工確認，輸出仍須由受訓評估者複核。"
 )
 
 if "v4_overrides" not in st.session_state:
@@ -2738,7 +2737,7 @@ elif page == 1:
                 st.session_state.v9_confirmed = False
             st.markdown('#### A. 快速自動建議（選用）')
             st.caption('比對三段影片的動作強度曲線；攝影角度差很多或反覆動作時可能建議錯誤，**不會自動套用**。')
-            if st.button('✨ 分析動作並建議時間偏移', key='v9_find_motion', use_container_width=True):
+            if st.button('分析動作並建議時間偏移', key='v9_find_motion', use_container_width=True):
                 try:
                     with st.spinner('正在以低解析度計算三支影片的動作變化…'):
                         motion = {c:v9_motion_from_bytes(upload_map[c].getvalue()) for c in active_cams}
@@ -2879,18 +2878,18 @@ v6_hand_policy='hand_first'
 if page == 4:
     st.subheader('啟動分析')
     ready_files=[name for name,f in [('正面',vid_front_file),('右側',vid_right_file),('左側',vid_left_file)] if f]
-    st.write('**已上傳：**'+('、'.join(ready_files) if ready_files else '尚未上傳影片'))
-    st.write(f'**抽樣數：**{num_samples}　｜　**分析模式：**{eval_mode}　｜　**手腕來源：Hand 優先／Pose 2D 備援**')
+    st.write('已上傳：'+('、'.join(ready_files) if ready_files else '尚未上傳影片'))
+    st.write(f'抽樣數：{num_samples}　｜　分析模式：{eval_mode})
     if leg_support_choice==LEG_OPTIONS[0] or any((right_wrist_twist_choice if side=='右手側' else left_wrist_twist_choice)==TWIST_OPTIONS[0]
          for side in (('右手側','左手側') if eval_mode.startswith('左右側') else (eval_mode,))):
         st.warning('請先返回「人工條件」填妥腿足支撐、所選側別的手腕扭轉，才能開始分析。')
-    st.write('**時間同步：**'+('已確認（'+st.session_state.v9_sync_mode+'）' if st.session_state.v9_confirmed else '尚未確認'))
+    st.write('時間同步：'+('已確認（'+st.session_state.v9_sync_mode+'）' if st.session_state.v9_confirmed else '尚未確認'))
     if not st.session_state.v9_confirmed:
         st.warning('先到「三鏡頭時間同步」預覽畫面並確認，否則不會開始分析。')
     st.caption('執行後自動跳到結果總覽；原本的三視角分析及 ZIP 報表功能皆保留。')
 
 # 執行分析按鈕
-if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="primary", use_container_width=True):
+if page == 4 and st.button("啟動分析", type="primary", use_container_width=True):
     is_dual_mode = eval_mode.startswith("左右側同步計算")
 
     # 嚴格檢查影片上傳完整性
