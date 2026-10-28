@@ -53,7 +53,7 @@ from PIL import Image, ImageDraw, ImageFont
 # Complexity 2 asks MediaPipe to download pose_landmark_heavy.tflite into site-packages,
 # which is typically read-only on hosted deployments.
 POSE_MODEL_COMPLEXITY = 1
-APP_BUILD_TAG = "RULA_V11_2_FINAL_REVIEW_CLARITY_2026-10-28"
+APP_BUILD_TAG = "RULA_V11_3_USER_NOTICE_ACTIONS_2026-10-28"
 
 # ==================== 【沿用 v6 RULA 查表矩陣：仍需標準工作表逐格核對】 ====================
 TABLE_A = {
@@ -1791,65 +1791,292 @@ def v8_encode_html_image(payload, caption=''):
             f'style="max-width:100%;max-height:540px;border-radius:8px"/><p>{html.escape(caption)}</p></div>')
 
 
-def v8_download_report_zip(original_zip, review_map):
-    """Append manual review statuses without changing automated CSV or scores."""
-    if not original_zip:
-        return b''
-    stream=io.BytesIO(original_zip)
-    with zipfile.ZipFile(stream,'a',zipfile.ZIP_DEFLATED) as archive:
-        rows=[{'樣本側別':k,'人工複核狀態':v} for k,v in sorted(review_map.items())]
-        archive.writestr('Diagnostics/Rejected_Manual_Reviews.csv',
-                         pd.DataFrame(rows,columns=['樣本側別','人工複核狀態']).to_csv(index=False).encode('utf-8-sig'))
-    return stream.getvalue()
+# ==================== 【V11.3：品質提醒也能逐張確認／人工計分／剔除】 ====================
+V113_KEEP = '維持／確認使用自動評分'
+V113_MANUAL = '改用人工重新評分'
+V113_EXCLUDE = '剔除此側樣本'
+V113_PENDING = '尚未確認'
+
+
+def v113_key(sample, side):
+    return f'{int(sample)}_{side}'
+
+
+def v113_dataframe_for_side(side, side_frames):
+    frame = (side_frames or {}).get(side)
+    return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+
+def v113_get_sample_row(side, sample, side_frames):
+    df = v113_dataframe_for_side(side, side_frames)
+    if df.empty or '樣本編號' not in df.columns:
+        return None
+    rows = df[pd.to_numeric(df['樣本編號'], errors='coerce') == int(sample)]
+    return None if rows.empty else rows.iloc[0]
+
+
+def v113_record_status(sample, side, source_row, decisions, overrides, flagged_keys, notice_keys, legacy=None):
+    """Decision of one side; missing data is never automatically accepted."""
+    key = v113_key(sample, side)
+    decision = decisions.get(key)
+    override = overrides.get((side, int(sample)))
+    flagged = key in flagged_keys
+    is_notice = key in notice_keys
+    if decision == V113_EXCLUDE:
+        return '人工剔除', None, None
+    if decision == V113_MANUAL:
+        if override is None:
+            return '等待人工重新評分', None, None
+        return '人工評分已完成', int(override['人工Grand Score']), str(override['人工AL'])
+    if override is not None and decision is None:
+        return '人工評分已完成', int(override['人工Grand Score']), str(override['人工AL'])
+    if source_row is None:
+        return '辨識失敗／無原始分數', None, None
+    if decision == V113_KEEP:
+        return '已人工確認採用自動評分', int(source_row['右手 Grand Score' if side=='右手側' else '左手 Grand Score']), str(source_row['右手 AL' if side=='右手側' else '左手 AL'])
+    if flagged and not is_notice:
+        if (legacy or {}).get(key) == '已目視確認關鍵點／分數（僅紀錄）':
+            return '已人工確認採用自動評分', int(source_row['右手 Grand Score' if side=='右手側' else '左手 Grand Score']), str(source_row['右手 AL' if side=='右手側' else '左手 AL'])
+        return '待複核（原始分數僅候選）', None, None
+    return ('一般提醒：預設保留自動評分' if is_notice else '自動品質通過'), int(source_row['右手 Grand Score' if side=='右手側' else '左手 Grand Score']), str(source_row['右手 AL' if side=='右手側' else '左手 AL'])
+
+
+def v113_build_reviewed_data(side_frames, items, decisions, overrides, legacy=None, mode=None):
+    """Produce reviewed side + combined reports without touching original automation data.
+
+    If dual mode and only one side is valid, preserve it as partial-side evidence but
+    do not claim a valid two-side maximum.
+    """
+    flagged_keys = {v113_key(item['樣本編號'],item['評估側']) for item in items if not v112_is_informational_notice(item)}
+    notice_keys = {v113_key(item['樣本編號'],item['評估側']) for item in items if v112_is_informational_notice(item)}
+    sides = [side for side in ('右手側', '左手側') if side in side_frames]
+    sampled = {side: {} for side in sides}
+    for side in sides:
+        df = v113_dataframe_for_side(side,side_frames)
+        if not df.empty:
+            for _,r in df.iterrows():
+                sampled[side][int(r['樣本編號'])]=r
+    allids=set()
+    for side in sides:
+        allids.update(sampled[side].keys())
+    allids.update(int(item['樣本編號']) for item in items if item.get('評估側') in sampled)
+    allids.update(int(sid) for (side,sid) in overrides if side in sampled)
+    allids.update(int(key.split('_',1)[0]) for key in decisions if key.split('_',1)[-1] in sampled)
+    rows=[]
+    for sid in sorted(allids):
+        for side in sides:
+            original=sampled[side].get(sid)
+            status,grand,al=v113_record_status(sid,side,original,decisions,overrides,flagged_keys,notice_keys,legacy)
+            rows.append({
+                '樣本編號':sid,'評估側':side,
+                '原始Grand Score':(original.get('右手 Grand Score' if side=='右手側' else '左手 Grand Score') if original is not None else None),
+                '原始AL':(original.get('右手 AL' if side=='右手側' else '左手 AL') if original is not None else None),
+                '複核後Grand Score':grand, '複核後AL':al,
+                '結果狀態':status,'使用者選擇':decisions.get(v113_key(sid,side),'未額外指定'),
+                '是否納入可信統計':grand is not None,
+                '原始品質狀態':(original.get('品質狀態','') if original is not None else '無有效自動評分'),
+            })
+    review_df=pd.DataFrame(rows, columns=['樣本編號','評估側','原始Grand Score','原始AL','複核後Grand Score','複核後AL','結果狀態','使用者選擇','是否納入可信統計','原始品質狀態'])
+    consolidated=[]
+    for sid in sorted(allids):
+        side_rows={r['評估側']:r for r in rows if r['樣本編號']==sid}
+        if len(sides)==2:
+            both_valid=all(side_rows[side]['是否納入可信統計'] for side in sides)
+            valid=[(side,side_rows[side]) for side in sides if side_rows[side]['是否納入可信統計']]
+            label=('完整雙側有效' if both_valid else ('僅單側有效（不可視為雙側最高分）' if valid else '雙側無有效分數'))
+            higher=max(valid,key=lambda x:x[1]['複核後Grand Score']) if valid else None
+            # Full comparison only if BOTH sides pass, otherwise no published dual score.
+            consolidated.append({'樣本編號':sid,'雙側結果狀態':label,
+                '右手結果狀態':side_rows['右手側']['結果狀態'],
+                '左手結果狀態':side_rows['左手側']['結果狀態'],
+                '右手複核後分數':side_rows['右手側']['複核後Grand Score'],
+                '左手複核後分數':side_rows['左手側']['複核後Grand Score'],
+                '完整雙側最高分':(higher[1]['複核後Grand Score'] if both_valid else None),
+                '完整雙側AL':(higher[1]['複核後AL'] if both_valid else None),
+                '最高風險側':(('雙側同分' if side_rows['右手側']['複核後Grand Score']==side_rows['左手側']['複核後Grand Score'] else higher[0]) if both_valid else '不可判定'),
+                '部分可用側別':('、'.join(side for side,_ in valid) if not both_valid else '')})
+        else:
+            side=sides[0]
+            r=side_rows[side]
+            consolidated.append({'樣本編號':sid,'雙側結果狀態':'單側分析','評估側':side,
+                '結果狀態':r['結果狀態'],'複核後Grand Score':r['複核後Grand Score'],'複核後AL':r['複核後AL']})
+    return review_df,pd.DataFrame(consolidated)
+
+
+def v113_current_reports():
+    mode=st.session_state.get('analyzed_mode','')
+    side_frames=({'右手側':st.session_state.get('df_right_only'),
+                  '左手側':st.session_state.get('df_left_only')} if mode=='左右側同步計算'
+                 else {mode:st.session_state.get('df_records')})
+    return v113_build_reviewed_data(side_frames,st.session_state.get('v8_rejected_rows',[]),
+            st.session_state.get('v113_review_decisions',{}),st.session_state.get('v4_overrides',{}),
+            st.session_state.get('v8_manual_rejected',{}),mode)
+
+
+def v113_make_manual_score(sample, side, values, original=None, time_s=None):
+    """Manual RULA components for a failed or suspect frame; no auto score fabricated."""
+    mapping={k:int(values[k]) for k in ('上臂','前臂','手腕','腕扭轉','頸部','軀幹','腿部','肌肉','負重')}
+    a,b,c,d,total,al=compute_rula_full(mapping['上臂'],mapping['前臂'],mapping['手腕'],mapping['腕扭轉'],mapping['頸部'],mapping['軀幹'],mapping['腿部'],mapping['肌肉'],mapping['負重'])
+    prefix='右手' if side=='右手側' else '左手'
+    return {'樣本編號':int(sample),'時間(秒)':float(original['時間(秒)'] if original is not None else (time_s or 0)),
+            '評估側':side, '原始Grand Score':(int(original[f'{prefix} Grand Score']) if original is not None else None),
+            '人工Grand Score':total,'原始AL':(original[f'{prefix} AL'] if original is not None else None),
+            '人工AL':al, '人工Score A':a,'人工Score B':b,'人工Score C':c,'人工Score D':d,
+            **{f'人工{k}分數':v for k,v in mapping.items()},
+            '異動說明':'使用者人工輸入九項 RULA 分數；不變更原始影像及原始自動分數'}
+
+
+def v113_manual_form(sample,side,item,source_row):
+    prefix='右手' if side=='右手側' else '左手'
+    defaults={'上臂':(f'{prefix}上臂分數',1,6),'前臂':(f'{prefix}前臂分數',1,3),
+              '手腕':(f'{prefix}手腕分數',1,4),'腕扭轉':(f'{prefix}手腕扭轉分數',1,2),
+              '頸部':('頸部分數',1,6),'軀幹':('軀幹分數',1,6),
+              '腿部':('腿部分數',1,2),'肌肉':('肌肉使用加分',0,1),
+              '負重':('負重施力加分',0,3)}
+    key=(side,int(sample))
+    previous=st.session_state.get('v4_overrides',{}).get(key,{})
+    st.info('請依原圖與 RULA 標準工作表**人工確認各部位分數**。預設值僅供編輯，不表示自動辨識可靠。')
+    with st.form(f'v113_manual_{side}_{sample}'):
+        cols=st.columns(3)
+        entered={}
+        for i,(label,(name,low,high)) in enumerate(defaults.items()):
+            initial=previous.get(f'人工{label}分數',source_row.get(name,low) if source_row is not None else low)
+            try: initial=int(initial)
+            except (TypeError,ValueError): initial=low
+            entered[label]=cols[i%3].number_input(label+'分數',min_value=low,max_value=high,value=max(low,min(high,initial)),step=1,key=f'v113_{side}_{sample}_{label}')
+        acknowledged=st.checkbox('我已人工檢查上述 RULA 各部位條件及分數',key=f'v113_ack_{side}_{sample}')
+        submitted=st.form_submit_button('儲存人工評分並採用此結果',type='primary')
+    if submitted:
+        if not acknowledged:
+            st.error('請先確認已依 RULA 工作表完成人工判斷，避免使用預設值當成測量結果。')
+        else:
+            result=v113_make_manual_score(sample,side,entered,source_row,item.get('時間(秒)'))
+            st.session_state.v4_overrides[key]=result
+            st.session_state.v113_review_decisions[v113_key(sample,side)]=V113_MANUAL
+            st.success(f'已儲存人工評分：{result["人工Grand Score"]} 分（{result["人工AL"]}），將用於複核後報表。')
+            st.rerun()
+    if previous:
+        st.success(f'目前人工評分：{previous["人工Grand Score"]} 分（{previous["人工AL"]}）')
+        if st.button('取消這筆人工評分（恢復待處理）',key=f'v113_remove_manual_{side}_{sample}'):
+            del st.session_state.v4_overrides[key]
+            st.rerun()
+
+
+def v113_finalize_report_zip(original_zip, side_frames, review_items, decisions, overrides, legacy=None):
+    """One export with original unmodified data and explicitly reviewed results."""
+    reviewed,combined=v113_build_reviewed_data(side_frames,review_items,decisions,overrides,legacy)
+    out=io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(original_zip),'r') as src, zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as dst:
+        seen=set()
+        for info in src.infolist():
+            if info.filename.startswith('Final_Reviewed/') or info.filename in ('Diagnostics/Rejected_Manual_Reviews.csv',):
+                continue
+            if info.filename in seen: continue
+            seen.add(info.filename)
+            dst.writestr(info,src.read(info.filename))
+        dst.writestr('Final_Reviewed/Side_Reviewed_Results.csv',reviewed.to_csv(index=False).encode('utf-8-sig'))
+        dst.writestr('Final_Reviewed/Combined_Reviewed_Results.csv',combined.to_csv(index=False).encode('utf-8-sig'))
+        history=[{'樣本編號':item.get('樣本編號'),'評估側':item.get('評估側'),'紀錄類型':item.get('紀錄類型','辨識失敗'),
+                  '警示原因':item.get('拒絕原因',''),
+                  '使用者選擇':decisions.get(v113_key(item['樣本編號'],item['評估側']),'未額外指定')} for item in review_items]
+        history_csv=pd.DataFrame(history,columns=['樣本編號','評估側','紀錄類型','警示原因','使用者選擇']).to_csv(index=False).encode('utf-8-sig')
+        dst.writestr('Final_Reviewed/Review_Decisions.csv',history_csv)
+        # 舊版 ZIP 讀取流程的相容檔名（含新增的三種使用者決定）。
+        dst.writestr('Diagnostics/Rejected_Manual_Reviews.csv',history_csv)
+        manual_cols=['樣本編號','評估側','人工Grand Score','人工AL','原始Grand Score','異動說明']
+        manual_df=pd.DataFrame(list(overrides.values())) if overrides else pd.DataFrame(columns=manual_cols)
+        dst.writestr('Final_Reviewed/Manual_RULA_Scores.csv',manual_df.to_csv(index=False).encode('utf-8-sig'))
+        dst.writestr('Final_Reviewed/README.txt',(
+            'RULA v11.3 複核後結果：原始 RULA_*、Photos 與 Diagnostics 資料維持不變。\n'
+            'Side_Reviewed_Results.csv 是依使用者決定與人工評分重新整理的側別結果。\n'
+            'Combined_Reviewed_Results.csv 僅在雙側皆有效時提供「完整雙側最高分」；單側有效者不可解讀為完整雙側評估。\n'
+            '一般品質提醒若未操作，預設保留原自動評分。待複核／辨識失敗若未處理則不列入可信統計。\n'
+            '手動剔除不刪除原始影格或原始 CSV。人工分數需由評估者依標準工作表確認。\n'
+            '以上是人工決策的資料管理，不能取代 RULA 查表及人體量測的獨立驗證。\n'
+        ).encode('utf-8'))
+    return out.getvalue()
 
 
 def v8_show_rejected_center():
-    st.subheader('被剔除／骨架品質待複核：雙照片對照')
-    st.caption('包含辨識失敗與骨架品質可疑樣本。左圖為原始照片，右圖優先保留當次分析骨架；其餘鏡頭可能是重新偵測的診斷圖。品質可疑時原分數仍在 CSV 作候選值，不當作已確認評分。')
+    st.subheader('剔除樣本／骨架品質提醒：逐張查看與處置')
+    st.caption('每筆都可點開原始照片與骨架照片；一般品質提醒預設保留自動分數，只有使用者認為不可靠時才改成人工評分或剔除。原始分析檔不會被覆蓋。')
     all_items=st.session_state.get('v8_rejected_rows',[])
-    records, notices = v112_split_review_items(all_items)
+    actionable,notices=v112_split_review_items(all_items)
     photos=st.session_state.get('v8_rejected_photos',{})
-    st.metric('需要處理的失敗／複核紀錄（側別）',len(records))
-    st.caption(f'另有 {len(notices)} 筆品質提醒（可採信，無須人工複核）；提醒不計入待處理數量。')
-    if notices:
-        with st.expander('查看一般品質提醒（可選，不影響原有分數）',expanded=False):
-            st.dataframe(pd.DataFrame(notices)[['樣本編號','評估側','拒絕原因']],
-                         hide_index=True,use_container_width=True)
-    if not records:
-        st.success('此次沒有需要人工複核或辨識失敗的樣本。')
+    st.session_state.setdefault('v113_review_decisions',{})
+    decisions=st.session_state.v113_review_decisions
+    a,b,c=st.columns(3)
+    a.metric('原始待處理紀錄',len(actionable))
+    b.metric('一般品質提醒（可選）',len(notices))
+    c.metric('使用者已決定處理',sum(v in (V113_MANUAL,V113_EXCLUDE,V113_KEEP) for v in decisions.values()))
+    if not all_items:
+        st.success('沒有剔除或品質提醒紀錄。')
         return
-    labels=[f"第{r['樣本編號']}筆｜{r['時間(秒)']}秒｜{r['評估側']}｜{r['拒絕原因']}" for r in records]
-    idx=st.selectbox('選擇紀錄',range(len(records)),format_func=lambda i:labels[i],key='v8_rejected_pick')
-    item=records[idx]
-    available=[camera for camera in ('Front','Right','Left')
-               if f"Sample_{item['樣本編號']:03d}_{item['評估側']}_{camera}" in photos]
-    if not available:
-        st.warning('影片讀取失敗，沒有可用的原始影格。')
-    else:
+    filter_choice=st.radio('查看哪些紀錄', ['需要處理','一般品質提醒','全部'],horizontal=True,key='v113_filter')
+    shown={'需要處理':actionable,'一般品質提醒':notices,'全部':actionable+notices}[filter_choice]
+    if not shown:
+        st.info('這個類別目前沒有樣本，可切換到其他類別。')
+        return
+    show_table=pd.DataFrame([{'樣本編號':x['樣本編號'],'評估側':x['評估側'],
+            '性質':('一般品質提醒' if v112_is_informational_notice(x) else '需處理'),
+            '原因':x.get('拒絕原因',''),
+            '使用者決定':decisions.get(v113_key(x['樣本編號'],x['評估側']),'預設保留自動評分' if v112_is_informational_notice(x) else '尚未處理')} for x in shown])
+    with st.expander('展開本類別的全部紀錄',expanded=False):
+        st.dataframe(show_table,use_container_width=True,hide_index=True)
+    choices=[f"第{x['樣本編號']}筆｜{x['評估側']}｜{('一般提醒' if v112_is_informational_notice(x) else '需處理')}" for x in shown]
+    idx=st.selectbox('選擇要查看照片的樣本',range(len(shown)),format_func=lambda i:choices[i],key=f'v113_pick_{filter_choice}')
+    item=shown[idx]
+    sid=int(item['樣本編號']);side=item['評估側'];key=v113_key(sid,side)
+    matched=[camera for camera in ('Front','Right','Left') if f'Sample_{sid:03d}_{side}_{camera}' in photos]
+    if matched:
         preferred=item.get('建議查看鏡頭','Front')
-        camera=st.radio('選擇鏡頭（預設失敗來源）',available,index=available.index(preferred) if preferred in available else 0,
-                        horizontal=True,key=f"v8_rejected_camera_{item['樣本編號']}_{item['評估側']}")
-        img=photos[f"Sample_{item['樣本編號']:03d}_{item['評估側']}_{camera}"]
-        a,b=st.columns(2)
-        with a:
+        cam=st.radio('查看鏡頭',matched,index=matched.index(preferred) if preferred in matched else 0,horizontal=True,
+                     key=f'v113_cam_{key}')
+        img=photos[f'Sample_{sid:03d}_{side}_{cam}']
+        raw_col,rendered_col=st.columns(2)
+        with raw_col:
             st.markdown('**未渲染原始照片**')
-            v10_show_image(img['raw'])
-        with b:
-            st.markdown('**系統骨架（本次分析或重新偵測）**')
-            v10_show_image(img['overlay'])
-        st.caption(f"有效繪製點：{img['points']}/33；偵測品質代理值：{img['quality']:.2f}；{img['note']}")
-    st.warning('標記原因：'+str(item['拒絕原因']))
-    if '跨視角診斷' in item:
-        st.caption('跨鏡頭提示：'+str(item.get('跨視角診斷','未檢查'))+'；時序檢查：'+str(item.get('時間重查判定','未檢查')))
-    if '評分狀態' in item:
-        st.info('評分狀態：'+str(item['評分狀態']))
-    key=f"{item['樣本編號']}_{item['評估側']}"
-    st.session_state.setdefault('v8_manual_rejected',{})
-    options=['尚未複核','需要人工量測','已目視確認關鍵點／分數（僅紀錄）','照片可辨識，但不恢復自動評分','確認無法辨識']
-    initial=st.session_state.v8_manual_rejected.get(key,'尚未複核')
-    mark=st.selectbox('人工檢查註記（不影響自動 RULA 分數）',options,index=options.index(initial),key='v8_reject_status_'+key)
-    st.session_state.v8_manual_rejected[key]=mark
-    st.caption('人工註記會加入最終 ZIP 的 Diagnostics/Rejected_Manual_Reviews.csv；不會默默改寫候選分數，若需改分請到人工修正工具。')
+            v10_show_image(img.get('raw'))
+        with rendered_col:
+            st.markdown('**系統骨架與可疑關節**')
+            v10_show_image(img.get('overlay'))
+        st.caption(f"辨識關鍵點：{img.get('points',0)}/33｜偵測品質代理值：{img.get('quality',0):.2f}｜{img.get('note','')}")
+    else:
+        st.warning('本筆影格沒有可供顯示的照片；請保留原始失敗紀錄。')
+    st.warning('品質原因：'+str(item.get('拒絕原因','未知')))
+    if item.get('跨視角診斷'):
+        st.caption('跨視角：'+str(item['跨視角診斷']))
+    side_frames=({'右手側':st.session_state.get('df_right_only'),
+                  '左手側':st.session_state.get('df_left_only')} if st.session_state.get('analyzed_mode')=='左右側同步計算'
+                 else {st.session_state.get('analyzed_mode'):st.session_state.get('df_records')})
+    original=v113_get_sample_row(side,sid,side_frames)
+    if original is not None:
+        st.caption('原始自動分數：'+str(original.get('右手 Grand Score' if side=='右手側' else '左手 Grand Score','未提供')))
+    is_notice=v112_is_informational_notice(item)
+    options=([V113_KEEP,V113_MANUAL,V113_EXCLUDE] if (is_notice or original is not None)
+             else [V113_PENDING,V113_MANUAL,V113_EXCLUDE])
+    stored=decisions.get(key, V113_KEEP if is_notice else V113_PENDING)
+    if stored not in options:stored=options[0]
+    selected=st.selectbox('這筆樣本如何處理？',options,index=options.index(stored),key=f'v113_action_{key}')
+    if selected!=decisions.get(key):
+        # Store even the default so the exported audit trail reflects the user's choice.
+        decisions[key]=selected
+    if selected==V113_KEEP:
+        st.success('這筆側別樣本保留原自動評分；選擇其他處理方式時會更新可信統計與複核後報表。')
+    elif selected==V113_EXCLUDE:
+        st.warning('已剔除此側樣本的可信分數；原圖、原始 CSV 與候選角度依然保留。雙側分析需兩側都可用，才會輸出完整雙側最高分。')
+    elif selected==V113_MANUAL:
+        v113_manual_form(sid,side,item,original)
+        if (side,sid) not in st.session_state.v4_overrides:
+            st.warning('尚未儲存人工 RULA 分數，此筆暫不列入可信統計。')
+    else:
+        st.info('仍待人工決定；不會把辨識失敗的樣本當作有效分數。')
+    reviewed,combined=v113_current_reports()
+    if not reviewed.empty:
+        r=reviewed[(reviewed['樣本編號']==sid)&(reviewed['評估側']==side)]
+        if not r.empty:
+            st.caption('目前複核後結果：'+str(r.iloc[0]['結果狀態']))
+    st.caption('所有決定將寫入下載 ZIP 的 Final_Reviewed/ 資料夾；可隨時回到本頁更改。')
 
 
 def v8_show_neck_center():
@@ -2247,7 +2474,7 @@ st.caption(f"部署版本：{APP_BUILD_TAG}｜執行檔：{os.path.basename(__fi
 if not callable(globals().get("add_hand_temporal_notes")):
     st.error("部署自檢失敗：add_hand_temporal_notes 未完成定義。請檢查 GitHub 上傳的 222.py 是否完整。")
     st.stop()
-st.caption("✅ RULA v11.2：僅強制複核真正未通過品質檢查的樣本；一般提醒保留在診斷 CSV。Hand 2D 優先、Pose 2D 備援。")
+st.caption("✅ RULA v11.3：一般品質提醒可看雙照片並自行採用／人工評分／剔除；僅強制複核真正未通過品質檢查的樣本；一般提醒保留在診斷 CSV。Hand 2D 優先、Pose 2D 備援。")
 
 st.markdown(
     "> **系統說明**：本工具以 MediaPipe Pose 關鍵點估算部分姿勢角度，遇到關鍵點可見度不足時會嘗試原圖、對比增強及放大圖；仍不可靠的樣本會略過。RULA 部分影像補正可選擇自動判讀；手腕扭轉、腿足支撐、聳肩、上臂支撐及扭轉等項目仍需人工確認，輸出仍須由受訓評估者複核，不應單獨作為醫療或職安決策依據。"
@@ -2296,6 +2523,7 @@ st.session_state.setdefault('v8_uploads',{})
 st.session_state.setdefault('v8_rejected_rows',[])
 st.session_state.setdefault('v8_rejected_photos',{})
 st.session_state.setdefault('v8_manual_rejected',{})
+st.session_state.setdefault('v113_review_decisions',{})
 st.session_state.setdefault('v9_confirmed',False)
 st.session_state.setdefault('v9_sync_mode','尚未同步')
 st.session_state.setdefault('v9_confirmed_signature',None)
@@ -2706,6 +2934,7 @@ if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="prima
         st.session_state.display_left_b64 = []
         st.session_state.zip_bytes = None
         st.session_state.hand_review_images = {}
+        st.session_state.v113_review_decisions = {}
         st.session_state.v8_rejected_rows = []
         st.session_state.v8_rejected_photos = {}
         st.session_state.v8_manual_rejected = {}
@@ -3591,48 +3820,40 @@ if st.session_state.v9_screen == 'results':
                 if st.session_state.get('v9_sync_summary') is not None:
                     with st.expander('本次三鏡頭時間同步結果',expanded=False):
                         st.dataframe(st.session_state.v9_sync_summary,use_container_width=True,hide_index=True)
-                if df_show is None or df_show.empty:
-                    st.warning('沒有共同有效樣本。可在剔除影格頁檢查失敗原因，單側資料可能仍在完整報表中。')
+                reviewed, reviewed_combined=v113_current_reports()
+                if (df_show is None or df_show.empty) and reviewed_combined.empty:
+                    st.warning('尚無可信分析結果；可到「剔除樣本」對失敗影格人工評分後再查看。')
                 else:
-                    if '品質可直接採信' in df_show.columns:
-                        qc_hold=df_show['品質可直接採信'].fillna(False).eq(False)
-                        # 原始自動評分仍保留；只有使用者明確確認或手動重新計分才解開待複核標記。
-                        review_map=st.session_state.get('v8_manual_rejected',{})
-                        overrides=st.session_state.get('v4_overrides',{})
-                        for row_idx,row in df_show.loc[qc_hold].iterrows():
-                            sid=int(row['樣本編號'])
-                            sides=('右手側','左手側') if mode_now=='左右側同步計算' else (mode_now,)
-                            unresolved=[]
-                            for side in sides:
-                                side_bad=(row.get(('右側骨架品質' if side=='右手側' else '左側骨架品質'),'需人工複核')=='需人工複核') if len(sides)>1 else True
-                                if not side_bad: continue
-                                confirmed=review_map.get(f'{sid}_{side}')=='已目視確認關鍵點／分數（僅紀錄）'
-                                edited=(side,sid) in overrides
-                                if not (confirmed or edited): unresolved.append(side)
-                            if not unresolved:
-                                qc_hold.loc[row_idx]=False
-                        st.metric('骨架品質待複核（不列入可信統計）',int(qc_hold.sum()))
-                        if qc_hold.any():
-                            st.warning('有樣本疑似遭遮擋或關節錯位；以下統計先排除未經人工確認的候選分數。完成複核並標記確認或重新計分後，會納入統計。')
-                        scored=df_show.loc[~qc_hold]
+                    if mode_now=='左右側同步計算':
+                        if reviewed_combined.empty:
+                            effective=pd.Series(dtype='float64')
+                        else:
+                            full=reviewed_combined[reviewed_combined['雙側結果狀態']=='完整雙側有效']
+                            effective=pd.to_numeric(full['完整雙側最高分'],errors='coerce').dropna()
+                        st.metric('完整雙側可用樣本',len(effective))
+                        left_ok=int(((reviewed['評估側']=='左手側') & (reviewed['是否納入可信統計'])).sum()) if not reviewed.empty else 0
+                        right_ok=int(((reviewed['評估側']=='右手側') & (reviewed['是否納入可信統計'])).sum()) if not reviewed.empty else 0
+                        st.caption(f'側別可用：右側 {right_ok} 筆、左側 {left_ok} 筆。若僅單側可用，完整雙側最高分留空，但該側原始資料與複核結果保留。')
                     else:
-                        scored=df_show
-                    scores=pd.to_numeric(scored['最終最高分'],errors='coerce')
-                    a,b,c,d=st.columns(4)
-                    a.metric('品質可採信樣本',len(scored))
-                    b.metric('平均 Grand Score',f'{scores.mean():.2f}' if not scores.empty else '—')
-                    c.metric('最高分',int(scores.max()) if not scores.empty else '—')
-                    d.metric('AL3／AL4 比例',f'{(scores.ge(5).mean()*100):.1f}%' if not scores.empty else '—')
-                    plot_time='分析經過時間(秒)' if '分析經過時間(秒)' in scored.columns else '時間(秒)'
-                    series=scored[[plot_time,'最終最高分']].copy().sort_values(plot_time)
-                    if not series.empty:
-                        st.line_chart(series.set_index(plot_time),x_label='分析經過時間（秒）' if plot_time=='分析經過時間(秒)' else '相對同步事件時間（秒）',y_label='RULA Grand Score')
+                        reviewed_ok=reviewed[reviewed['是否納入可信統計']] if not reviewed.empty else pd.DataFrame()
+                        effective=pd.to_numeric(reviewed_ok['複核後Grand Score'],errors='coerce').dropna() if not reviewed_ok.empty else pd.Series(dtype='float64')
+                    a,b,c=st.columns(3)
+                    a.metric('可信總分樣本',len(effective))
+                    b.metric('平均 Grand Score',f'{effective.mean():.2f}' if not effective.empty else '—')
+                    c.metric('AL3／AL4 比例',f'{effective.ge(5).mean()*100:.1f}%' if not effective.empty else '—')
+                    if not effective.empty:
+                        st.metric('最高分',int(effective.max()))
+                    if mode_now=='左右側同步計算' and not reviewed_combined.empty:
+                        full=reviewed_combined[reviewed_combined['雙側結果狀態']=='完整雙側有效']
+                        if not full.empty:
+                            st.line_chart(full.set_index('樣本編號')[['完整雙側最高分']],y_label='RULA Grand Score')
+                        st.dataframe(reviewed_combined,use_container_width=True,hide_index=True)
+                    elif not reviewed.empty:
+                        st.line_chart(reviewed[reviewed['是否納入可信統計']].set_index('樣本編號')[['複核後Grand Score']],y_label='RULA Grand Score')
                     else:
-                        st.warning('目前沒有通過骨架品質篩檢的分數，請檢查複核清單。')
-                    if '最危害側' in df_show.columns and mode_now=='左右側同步計算':
-                        st.write('**最危害側統計（含雙側同分）**')
-                        st.dataframe(scored['最危害側'].value_counts().rename_axis('分類').reset_index(name='筆數'),hide_index=True)
-                    st.caption('平均數僅用於描述性統計，正式 RULA 風險仍需關注最危險姿勢與工作條件。')
+                        st.warning('目前尚無可用的可信評分。')
+                    st.caption('此處依使用者在「剔除樣本」分頁的決定與人工重新計分動態更新；原始 CSV 不修改。複核後資料請下載 Final_Reviewed 報表。')
+                    st.caption('平均數僅作描述性統計，不能取代 RULA 對高風險姿勢的判斷。')
                 st.info('時間欄位說明：「共同時間」以三鏡頭同步事件為 0 秒，事件前會是負數；「分析經過時間」從取樣開始算 0 秒。兩者都保留在 ZIP，分數不受影響。')
         if tab_review.open:
             with tab_review:
@@ -3675,16 +3896,19 @@ if st.session_state.v9_screen == 'results':
         if tab_reports.open:
             with tab_reports:
                 st.subheader('完整報表與下載')
-                if df_show is not None and not df_show.empty:
-                    if mode_now=='左右側同步計算':
-                        table_choice=st.radio('報表類型',['左右共同','右側完整','左側完整'],horizontal=True,key='v8_report_choice')
-                        table={'左右共同':df_show,'右側完整':st.session_state.df_right_only,
-                               '左側完整':st.session_state.df_left_only}[table_choice]
-                        st.dataframe(table,use_container_width=True,hide_index=True)
-                    else:
-                        st.dataframe(df_show,use_container_width=True,hide_index=True)
+                reviewed,reviewed_combined=v113_current_reports()
+                if mode_now=='左右側同步計算':
+                    table_choice=st.radio('報表類型',['複核後雙側彙整','複核後逐側','原始左右共同','原始右側','原始左側'],horizontal=True,key='v8_report_choice')
+                    table={'複核後雙側彙整':reviewed_combined,'複核後逐側':reviewed,
+                           '原始左右共同':df_show,'原始右側':st.session_state.df_right_only,
+                           '原始左側':st.session_state.df_left_only}[table_choice]
                 else:
-                    st.warning('沒有可用的共同有效資料，但仍可下載診斷 ZIP。')
+                    table_choice=st.radio('報表類型',['複核後逐側','原始分析'],horizontal=True,key='v8_report_choice')
+                    table=reviewed if table_choice=='複核後逐側' else df_show
+                if table is not None and not table.empty:
+                    st.dataframe(table,use_container_width=True,hide_index=True)
+                else:
+                    st.warning('目前這個報表沒有可用資料，請查看其他類型或下載診斷 ZIP。')
         if tab_download.open:
             with tab_download:
                 st.subheader('匯出報表及診斷 ZIP')
@@ -3697,13 +3921,21 @@ if st.session_state.v9_screen == 'results':
                             source_dfs={'右手側':st.session_state.df_right_only,'左手側':st.session_state.df_left_only}
                         else:
                             source_dfs={mode_now:st.session_state.df_records}
-                        anomaly=pd.concat([v4_mark_anomalies(data,side) for side,data in source_dfs.items()
-                                      if data is not None and not data.empty],ignore_index=True)
+                        anomaly_parts=[v4_mark_anomalies(data,side) for side,data in source_dfs.items()
+                                      if data is not None and not data.empty]
+                        anomaly=pd.concat(anomaly_parts,ignore_index=True) if anomaly_parts else pd.DataFrame()
                         initial_zip=v4_make_zip(initial_zip,st.session_state.v4_overrides,anomaly)
-                    finalized=v8_download_report_zip(initial_zip,st.session_state.get('v8_manual_rejected',{}))
+                    side_frames=({'右手側':st.session_state.df_right_only,
+                                  '左手側':st.session_state.df_left_only} if mode_now=='左右側同步計算'
+                                 else {mode_now:st.session_state.df_records})
+                    finalized=v113_finalize_report_zip(initial_zip,side_frames,
+                        st.session_state.get('v8_rejected_rows',[]),
+                        st.session_state.get('v113_review_decisions',{}),
+                        st.session_state.get('v4_overrides',{}),
+                        st.session_state.get('v8_manual_rejected',{}))
                     render_blob_download_button(finalized,st.session_state.zip_filename,
-                                                f'📥 下載 {mode_now} 完整分析＋失敗影格 ZIP')
-                st.caption('ZIP 含作業基本資料、自動命名、骨架品質診斷、可疑樣本雙照片、頸部比較與人工註記。疑似錯位的分數保留作候選值，但可信統計排除未複核樣本。')
+                                                f'📥 下載 {mode_now} 原始＋複核後報表 ZIP')
+                st.caption('ZIP 保留原始資料及照片；Final_Reviewed/ 另含使用者決定、人工評分與複核後可信統計。單側剔除不會偽裝成已完成雙側評估。')
 # 只有分析前六步才顯示底部「上一步／下一步」；結果頁使用分頁，不再有步驟按鈕。
 if st.session_state.v9_screen == 'setup':
     st.divider()

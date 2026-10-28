@@ -64,6 +64,6 @@ class TestOcclusion(unittest.TestCase):
     def test_does_not_change_rula_formula(self):
         text=FILE.read_text(encoding='utf-8')
         self.assertIn('Hand 2D（優先）',text)
-        self.assertIn('RULA_V11_2_FINAL_REVIEW_CLARITY_',text)
+        self.assertIn('RULA_V11_3_USER_NOTICE_ACTIONS_',text)
 
 if __name__=='__main__':unittest.main(verbosity=2)
