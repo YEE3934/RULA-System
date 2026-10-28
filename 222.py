@@ -2949,8 +2949,8 @@ def user_report_wrist(df, side):
 
 
 # ==================== 【Streamlit 網頁應用介面】 ====================
-st.set_page_config(page_title="RULA 三視角人因工程 AI 評估系統", layout="wide")
-st.title("RULA 智慧姿勢評估系統")
+st.set_page_config(page_title="RULA線上評分系統", layout="wide")
+st.title("RULA 線上評分系統")
 with st.sidebar.expander('系統維護資訊', expanded=False):
     st.caption(f"部署識別：{APP_BUILD_TAG}｜程式：{os.path.basename(__file__)}")
 
@@ -2962,7 +2962,7 @@ if not callable(globals().get("add_hand_temporal_notes")):
 st.caption("自動辨識姿勢與計算 RULA 評分；品質不確定的樣本可檢視原圖、人工評分或剔除。")
 
 st.markdown(
-    "> **系統說明**：本工具以 MediaPipe Pose 關鍵點估算部分姿勢角度，遇到關鍵點可見度不足時會嘗試原圖、對比增強及放大圖；仍不可靠的樣本會略過。RULA 部分影像補正可選擇自動判讀；手腕扭轉、腿足支撐、聳肩、上臂支撐及扭轉等項目仍需人工確認，輸出仍須由受訓評估者複核，不應單獨作為醫療或職安決策依據。"
+    "> **系統說明**：本工具以 MediaPipe Pose 關鍵點估算部分姿勢角度，遇到關鍵點可見度不足時會嘗試原圖、對比增強及放大圖；仍不可靠的樣本會略過。RULA 部分影像補正可選擇自動判讀；手腕扭轉、腿足支撐、聳肩、上臂支撐及扭轉等項目仍需人工確認，輸出仍須由受訓評估者複核。"
 )
 
 if "v4_overrides" not in st.session_state:
@@ -3200,7 +3200,7 @@ if page == 0:
     with d: num_samples=v8_widget('slider','抽樣數量','num_samples',25,min_value=5,max_value=100)
     with e: combo_muscle=v8_widget('selectbox','肌肉使用加分','muscle',MUSCLE_OPTIONS[0],options=MUSCLE_OPTIONS)
     with f: combo_force=v8_widget('selectbox','負重施力加分','force',FORCE_OPTIONS[0],options=FORCE_OPTIONS)
-    with st.expander('骨架品質與遮擋篩檢（選用，預設保守）', expanded=False):
+    with st.expander('骨架品質與遮擋篩檢', expanded=False):
         v11_qc_policy=v8_widget('selectbox','複核警示敏感度','v11_qc_policy',V11_QC_MODES[0],options=V11_QC_MODES)
         st.caption('只列嚴重疑慮是預設；頭頸與手臂可能重疊時先做幾何及前後影格檢查，仍不可靠才送人工複核。這是品質風險篩檢，不能證明關節實際位置。')
     st.info('三台攝影機不需要同時開始或拍一樣長；下一步會校正共同時間，之後才正式分析。')
@@ -3369,18 +3369,18 @@ v6_hand_policy='hand_first'
 if page == 4:
     st.subheader('啟動分析')
     ready_files=[name for name,f in [('正面',vid_front_file),('右側',vid_right_file),('左側',vid_left_file)] if f]
-    st.write('**已上傳：**'+('、'.join(ready_files) if ready_files else '尚未上傳影片'))
-    st.write(f'**抽樣數：**{num_samples}　｜　**分析模式：**{eval_mode}　｜　**手腕來源：Hand 優先／Pose 2D 備援**')
+    st.write('已上傳：'+('、'.join(ready_files) if ready_files else '尚未上傳影片'))
+    st.write(f'抽樣數：{num_samples}　｜　分析模式：{eval_mode}')
     if leg_support_choice==LEG_OPTIONS[0] or any((right_wrist_twist_choice if side=='右手側' else left_wrist_twist_choice)==TWIST_OPTIONS[0]
          for side in (('右手側','左手側') if eval_mode.startswith('左右側') else (eval_mode,))):
         st.warning('請先返回「人工條件」填妥腿足支撐、所選側別的手腕扭轉，才能開始分析。')
-    st.write('**時間同步：**'+('已確認（'+st.session_state.v9_sync_mode+'）' if st.session_state.v9_confirmed else '尚未確認'))
+    st.write('時間同步：'+('已確認（'+st.session_state.v9_sync_mode+'）' if st.session_state.v9_confirmed else '尚未確認'))
     if not st.session_state.v9_confirmed:
         st.warning('先到「三鏡頭時間同步」預覽畫面並確認，否則不會開始分析。')
     st.caption('執行後自動跳到結果總覽；原本的三視角分析及 ZIP 報表功能皆保留。')
 
 # 執行分析按鈕
-if page == 4 and st.button("🚀 啟動全關節生物力學分析", type="primary", use_container_width=True):
+if page == 4 and st.button("啟動分析", type="primary", use_container_width=True):
     is_dual_mode = eval_mode.startswith("左右側同步計算")
 
     # 嚴格檢查影片上傳完整性
