@@ -1,8 +1,9 @@
 import ast, pandas as pd, io, zipfile, math
-source=open('/mnt/data/222_rula_v11_3.py',encoding='utf-8').read()
+import pathlib
+source=(pathlib.Path(__file__).resolve().parents[1]/'222.py').read_text(encoding='utf-8')
 tree=ast.parse(source)
 funcs={n.name:n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))}
-selected=['v112_is_informational_notice','v113_key','v113_dataframe_for_side','v113_get_sample_row','v113_record_status','v113_build_reviewed_data','v113_make_manual_score','v113_finalize_report_zip']
+selected=['v112_is_informational_notice','v113_key','v113_dataframe_for_side','v113_get_sample_row','v113_record_status','v113_build_reviewed_data','v113_make_manual_score','v113_finalize_report_zip','user_report_reviewed']
 ns={'pd':pd,'io':io,'zipfile':zipfile}
 ns.update({k:next(n.value for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(x,ast.Name) and x.id==k for x in n.targets)) for k in ['V113_KEEP','V113_MANUAL','V113_EXCLUDE','V113_PENDING']})
 # compile only selected def, not whole streamlit top-level UI
@@ -52,10 +53,10 @@ with zipfile.ZipFile(io.BytesIO(final)) as z:
  assert z.testzip() is None
  names=z.namelist(); assert len(names)==len(set(names))
  assert z.read('RULA_original.csv')==b'original unchanged'
- assert 'Final_Reviewed/Review_Decisions.csv' in names
- combo=pd.read_csv(io.BytesIO(z.read('Final_Reviewed/Combined_Reviewed_Results.csv')))
- assert pd.isna(combo.query('樣本編號==1').iloc[0]['完整雙側最高分'])
- assert combo.query('樣本編號==2').iloc[0]['完整雙側最高分']==4
-assert 'RULA_V11_3_USER_NOTICE_ACTIONS_2026-10-28' in source
+ assert '複核後結果/使用者複核紀錄.csv' in names
+ combo=pd.read_csv(io.BytesIO(z.read('複核後結果/雙側結果.csv')))
+ assert pd.isna(combo.query('樣本編號==1').iloc[0]['雙側最高分'])
+ assert combo.query('樣本編號==2').iloc[0]['雙側最高分']==4
+assert 'RULA_FINAL_SAME_SIDE_NECK_CLEAN_REPORT_2026-10-29' in source
 assert source.index('def v113_build_reviewed_data') < source.index('if st.session_state.v9_screen == \'results\':')
 print('Passed: 12 targeted review/report/ZIP scenarios')
